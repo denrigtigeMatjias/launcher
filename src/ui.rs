@@ -16,7 +16,6 @@ use crate::{mods, storage};
 
 // ---------- palette ----------
 const BG: Color32 = Color32::from_rgb(13, 15, 20);
-const SIDEBAR: Color32 = Color32::from_rgb(18, 21, 28);
 const CARD: Color32 = Color32::from_rgb(24, 28, 37);
 const FIELD: Color32 = Color32::from_rgb(15, 18, 24);
 const BORDER: Color32 = Color32::from_rgb(38, 44, 57);
@@ -115,6 +114,8 @@ enum Event {
 enum Action {
     AddGame,
     SelectGame(usize),
+    PlayGame(usize),
+    ShowLibrary,
     DeleteGame,
     SelectProfile(usize),
     NewProfile,
@@ -139,6 +140,7 @@ pub struct App {
     confirm_delete_game: bool,
     confirm_delete_profile: bool,
     focus_game_name: bool,
+    show_library: bool,
     ctx: egui::Context,
 }
 
@@ -169,6 +171,7 @@ impl App {
             confirm_delete_game: false,
             confirm_delete_profile: false,
             focus_game_name: false,
+            show_library: true,
             ctx: ctx.clone(),
         };
         app.select_game(app.game);
@@ -219,14 +222,27 @@ impl App {
                 self.library.games.push(Game::new(name));
                 self.select_game(Some(self.library.games.len() - 1));
                 self.focus_game_name = true;
+                self.show_library = false;
                 self.mark_dirty();
             }
-            Action::SelectGame(i) => self.select_game(Some(i)),
+            Action::SelectGame(i) => {
+                self.select_game(Some(i));
+                self.show_library = false;
+            }
+            Action::PlayGame(i) => {
+                self.select_game(Some(i));
+                self.play();
+            }
+            Action::ShowLibrary => {
+                self.show_library = true;
+                self.confirm_delete_game = false;
+            }
             Action::DeleteGame => {
                 if let Some(g) = self.game {
                     let removed = self.library.games.remove(g);
                     self.select_game(if self.library.games.is_empty() { None } else { Some(g.saturating_sub(1)) });
                     self.toast(format!("Removed {}", removed.name), Tone::Info);
+                    self.show_library = true;
                     self.mark_dirty();
                 }
             }
@@ -497,70 +513,203 @@ fn ghost_button(text: impl Into<String>, color: Color32) -> Button<'static> {
     Button::new(RichText::new(text.into()).color(color)).frame(false)
 }
 
+fn add_tile(ui: &mut Ui, size: Vec2, actions: &mut Vec<Action>) {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = resp.hovered();
+    let color = if hovered { ACCENT } else { BORDER };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(14), if hovered { Color32::from_rgb(26, 24, 44) } else { BG });
+    painter.rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.5, color), egui::StrokeKind::Inside);
+    painter.circle_stroke(rect.center() - vec2(0.0, 14.0), 22.0, Stroke::new(1.5, color));
+    painter.text(rect.center() - vec2(0.0, 14.0), Align2::CENTER_CENTER, "＋", FontId::proportional(22.0), if hovered { TEXT } else { MUTED });
+    painter.text(rect.center() + vec2(0.0, 26.0), Align2::CENTER_CENTER, "Add game", FontId::proportional(14.0), if hovered { TEXT } else { MUTED });
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        actions.push(Action::AddGame);
+    }
+}
+
+/// Darken from `top` to `bottom` alpha over the lower part of `rect`.
+fn paint_vertical_fade(painter: &egui::Painter, rect: egui::Rect, top: Color32, bottom: Color32) {
+    let start = rect.top() + rect.height() * 0.35;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(egui::pos2(rect.left(), start), top);
+    mesh.colored_vertex(egui::pos2(rect.right(), start), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+}
+
+/// A wide banner that fades from the game's colour into the card colour.
+fn paint_banner(ui: &Ui, rect: egui::Rect, color: Color32) {
+    let painter = ui.painter();
+    let dim = |c: u8| (c as f32 * 0.45) as u8;
+    let left = Color32::from_rgb(dim(color.r()), dim(color.g()), dim(color.b()));
+    let r = 16.0;
+    painter.rect_filled(rect, CornerRadius::same(16), CARD);
+    painter.rect_filled(egui::Rect::from_min_size(rect.min, vec2(r * 3.0, rect.height())), CornerRadius::same(16), left);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(egui::pos2(rect.left() + r, rect.top()), left);
+    mesh.colored_vertex(egui::pos2(rect.right() - r, rect.top()), CARD);
+    mesh.colored_vertex(egui::pos2(rect.right() - r, rect.bottom()), CARD);
+    mesh.colored_vertex(egui::pos2(rect.left() + r, rect.bottom()), left);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+    painter.rect_stroke(rect, CornerRadius::same(16), Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+}
+
 // ---------- panels ----------
 
 impl App {
-    fn sidebar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-            ui.painter().rect_filled(rect, CornerRadius::same(9), ACCENT);
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "▶", FontId::proportional(14.0), Color32::WHITE);
-            ui.label(RichText::new("Launcher").size(20.0).strong());
-        });
-        ui.add_space(14.0);
-        if ui.add(Button::new("＋  Add game").min_size(vec2(ui.available_width(), 38.0))).clicked() {
-            actions.push(Action::AddGame);
+    fn pending_banner(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        if !self.pending.is_empty() {
+            Frame::new()
+                .fill(Color32::from_rgb(52, 40, 18))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(110, 80, 30)))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::symmetric(16, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let folders: Vec<String> =
+                            self.pending.iter().map(|o| o.target.to_string_lossy().into_owned()).collect();
+                        ui.label(RichText::new("⚠").color(AMBER).size(18.0));
+                        ui.label(RichText::new(format!("Mod files are still applied in {}", folders.join(", "))).color(AMBER));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Restore originals").clicked() {
+                                actions.push(Action::RestorePending);
+                            }
+                        });
+                    });
+                });
+            ui.add_space(10.0);
         }
-        ui.add_space(14.0);
-        ui.label(RichText::new(format!("LIBRARY · {}", self.library.games.len())).color(MUTED).small().strong());
-        ui.add_space(2.0);
+
+    }
+
+    fn library_view(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+            ui.painter().rect_filled(rect, CornerRadius::same(10), ACCENT);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "▶", FontId::proportional(16.0), Color32::WHITE);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Library").size(26.0));
+                let n = self.library.games.len();
+                ui.label(RichText::new(format!("{n} game{}", if n == 1 { "" } else { "s" })).color(MUTED).small());
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !self.library.games.is_empty() && ui.add(primary_button("＋  Add game", vec2(150.0, 42.0))).clicked() {
+                    actions.push(Action::AddGame);
+                }
+            });
+        });
+        ui.add_space(16.0);
+        self.pending_banner(ui, actions);
+
+        if self.library.games.is_empty() {
+            self.empty_state(ui, actions);
+            return;
+        }
 
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (i, game) in self.library.games.iter().enumerate() {
-                let selected = self.game == Some(i);
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::click());
-                let fill = if selected {
-                    Color32::from_rgb(36, 33, 62)
-                } else if resp.hovered() {
-                    Color32::from_rgb(28, 32, 42)
-                } else {
-                    Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
-                if selected {
-                    let bar = egui::Rect::from_min_size(rect.min + vec2(0.0, 14.0), vec2(3.0, 28.0));
-                    ui.painter().rect_filled(bar, CornerRadius::same(2), ACCENT);
-                }
-                let av = egui::Rect::from_min_size(rect.min + vec2(12.0, 10.0), vec2(36.0, 36.0));
-                paint_avatar(ui, av, &game.name);
-                let x = av.right() + 12.0;
-                ui.painter().text(
-                    egui::pos2(x, rect.top() + 19.0),
-                    Align2::LEFT_CENTER,
-                    ellipsize(&game.name, 20),
-                    FontId::proportional(15.0),
-                    TEXT,
-                );
-                let running = self.is_running(&game.name, None);
-                let sub = if running {
-                    "● Running".to_string()
-                } else {
-                    let n = game.profiles.len();
-                    format!("{n} profile{}", if n == 1 { "" } else { "s" })
-                };
-                ui.painter().text(
-                    egui::pos2(x, rect.top() + 38.0),
-                    Align2::LEFT_CENTER,
-                    sub,
-                    FontId::proportional(12.5),
-                    if running { GREEN } else { MUTED },
-                );
-                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    actions.push(Action::SelectGame(i));
-                }
+            let gap = 18.0;
+            let full = ui.available_width();
+            let cols = ((full + gap) / (220.0 + gap)).floor().max(1.0) as usize;
+            let w = (full - gap * (cols as f32 - 1.0)) / cols as f32 - 0.5;
+            let h = w * 0.62 + 70.0;
+            let count = self.library.games.len() + 1; // + the "add game" tile
+            for row in 0..count.div_ceil(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for col in 0..cols {
+                        let i = row * cols + col;
+                        if i < self.library.games.len() {
+                            self.game_tile(ui, i, vec2(w, h), actions);
+                        } else if i == self.library.games.len() {
+                            add_tile(ui, vec2(w, h), actions);
+                        }
+                    }
+                });
+                ui.add_space(gap - ui.spacing().item_spacing.y);
             }
         });
+    }
+
+    fn game_tile(&self, ui: &mut Ui, i: usize, size: Vec2, actions: &mut Vec<Action>) {
+        let game = &self.library.games[i];
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+        let hovered = resp.hovered();
+        let painter = ui.painter();
+        let color = avatar_color(&game.name);
+        let r = 14u8;
+
+        // lift on hover
+        let rect = if hovered { rect.translate(vec2(0.0, -3.0)) } else { rect };
+        painter.rect_filled(rect.translate(vec2(0.0, 6.0)), CornerRadius::same(r), Color32::from_black_alpha(70));
+        painter.rect_filled(rect, CornerRadius::same(r), CARD);
+
+        // artwork area
+        let art = egui::Rect::from_min_size(rect.min, vec2(rect.width(), rect.height() - 70.0));
+        painter.rect_filled(art, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, color);
+        paint_vertical_fade(painter, art, Color32::from_black_alpha(0), Color32::from_black_alpha(110));
+        painter.text(
+            art.center(),
+            Align2::CENTER_CENTER,
+            initials(&game.name),
+            FontId::proportional(art.height() * 0.36),
+            Color32::from_white_alpha(235),
+        );
+
+        let running = self.is_running(&game.name, None);
+        if running {
+            let badge = egui::Rect::from_min_size(art.min + vec2(10.0, 10.0), vec2(84.0, 24.0));
+            painter.rect_filled(badge, CornerRadius::same(12), Color32::from_black_alpha(170));
+            painter.text(badge.center(), Align2::CENTER_CENTER, "● Running", FontId::proportional(12.5), GREEN);
+        }
+
+        // quick play button on hover
+        let play_center = art.center();
+        let play_r = 28.0;
+        let over_play = resp.hover_pos().is_some_and(|p| p.distance(play_center) <= play_r + 4.0);
+        if hovered && !running {
+            painter.rect_filled(art, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, Color32::from_black_alpha(90));
+            painter.circle_filled(play_center, play_r, if over_play { ACCENT_HOVER } else { ACCENT });
+            painter.text(play_center + vec2(2.0, 0.0), Align2::CENTER_CENTER, "▶", FontId::proportional(22.0), Color32::WHITE);
+        }
+
+        // name and details
+        painter.text(
+            egui::pos2(rect.left() + 14.0, art.bottom() + 22.0),
+            Align2::LEFT_CENTER,
+            ellipsize(&game.name, ((rect.width() - 28.0) / 8.5) as usize),
+            FontId::proportional(16.0),
+            TEXT,
+        );
+        let default = game.default().map(|p| p.name.as_str()).unwrap_or("-");
+        let n = game.profiles.len();
+        painter.text(
+            egui::pos2(rect.left() + 14.0, art.bottom() + 46.0),
+            Align2::LEFT_CENTER,
+            ellipsize(&format!("★ {default} · {n} profile{}", if n == 1 { "" } else { "s" }), ((rect.width() - 28.0) / 6.5) as usize),
+            FontId::proportional(12.5),
+            MUTED,
+        );
+
+        if hovered {
+            painter.rect_stroke(rect, CornerRadius::same(r), Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
+        }
+
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            if over_play && !running {
+                actions.push(Action::PlayGame(i));
+            } else {
+                actions.push(Action::SelectGame(i));
+            }
+        }
     }
 
     fn empty_state(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -588,29 +737,6 @@ impl App {
     fn game_view(&mut self, ui: &mut Ui, g: usize, actions: &mut Vec<Action>) {
         let mut changed = false;
 
-        if !self.pending.is_empty() {
-            Frame::new()
-                .fill(Color32::from_rgb(52, 40, 18))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(110, 80, 30)))
-                .corner_radius(CornerRadius::same(12))
-                .inner_margin(Margin::symmetric(16, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let folders: Vec<String> =
-                            self.pending.iter().map(|o| o.target.to_string_lossy().into_owned()).collect();
-                        ui.label(RichText::new("⚠").color(AMBER).size(18.0));
-                        ui.label(RichText::new(format!("Mod files are still applied in {}", folders.join(", "))).color(AMBER));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Restore originals").clicked() {
-                                actions.push(Action::RestorePending);
-                            }
-                        });
-                    });
-                });
-            ui.add_space(10.0);
-        }
-
         // ----- header -----
         let game_name_before = self.library.games[g].name.clone();
         let profile_count = self.library.games[g].profiles.len();
@@ -620,20 +746,27 @@ impl App {
             self.library.games[g].profiles.get(self.profile).map(|p| p.name.clone()).unwrap_or_default();
         let running_profile = self.is_running(&game_name_before, Some(&current_profile_name));
 
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
+        if ui.add(ghost_button("←  Library", MUTED)).clicked() {
+            actions.push(Action::ShowLibrary);
+        }
+        ui.add_space(4.0);
+        let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.0), Sense::hover());
+        paint_banner(ui, banner, avatar_color(&game_name_before));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(banner.shrink2(vec2(28.0, 0.0))), |ui| {
+            ui.horizontal_centered(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(96.0, 96.0), Sense::hover());
                 paint_avatar(ui, rect, &game_name_before);
-                ui.add_space(8.0);
+                ui.add_space(12.0);
                 ui.vertical(|ui| {
+                    ui.add_space(30.0);
                     let game = &mut self.library.games[g];
                     let resp = ui.add(
                         TextEdit::singleline(&mut game.name)
-                            .font(FontId::proportional(28.0))
+                            .font(FontId::proportional(32.0))
                             .frame(Frame::NONE)
                             .background_color(Color32::TRANSPARENT)
                             .hint_text("Game name")
-                            .desired_width(ui.available_width() - 260.0),
+                            .desired_width(ui.available_width() - 230.0),
                     );
                     if self.focus_game_name {
                         resp.request_focus();
@@ -650,7 +783,7 @@ impl App {
                             "{profile_count} profile{} · default: {default}",
                             if profile_count == 1 { "" } else { "s" }
                         ))
-                        .color(MUTED)
+                        .color(Color32::from_rgb(200, 205, 215))
                     };
                     ui.label(status);
                 });
@@ -967,13 +1100,6 @@ impl eframe::App for App {
 
         let mut actions = vec![];
 
-        egui::Panel::left("sidebar")
-            .exact_size(260.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::new().fill(SIDEBAR).inner_margin(Margin::symmetric(14, 16)))
-            .show(ui, |ui| self.sidebar(ui, &mut actions));
-
         egui::Panel::bottom("status")
             .exact_size(34.0)
             .show_separator_line(false)
@@ -983,8 +1109,11 @@ impl eframe::App for App {
         egui::CentralPanel::no_frame()
             .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(28, 22)))
             .show(ui, |ui| match self.game {
-                Some(g) => self.game_view(ui, g, &mut actions),
-                None => self.empty_state(ui, &mut actions),
+                Some(g) if !self.show_library => {
+                    self.pending_banner(ui, &mut actions);
+                    self.game_view(ui, g, &mut actions)
+                }
+                _ => self.library_view(ui, &mut actions),
             });
 
         for a in actions {
