@@ -10,7 +10,8 @@ use eframe::egui::{
 };
 
 use crate::launch::{self, ExitInfo};
-use crate::model::{EnvVar, Game, Library, Profile, unique_name};
+use crate::model::{EnvVar, Game, LaunchKind, Library, Profile, unique_name};
+use crate::repos::{self, Repo};
 use crate::{mods, storage};
 
 // ---------- palette ----------
@@ -134,6 +135,7 @@ pub struct App {
     events_tx: Sender<Event>,
     events_rx: Receiver<Event>,
     pending: Vec<mods::Overlay>,
+    repos: Vec<Repo>,
     confirm_delete_game: bool,
     confirm_delete_profile: bool,
     focus_game_name: bool,
@@ -150,6 +152,8 @@ impl App {
                 Some(Toast { text: format!("Could not read your library: {e:#}"), tone: Tone::Bad, at: Instant::now() }),
             ),
         };
+        let (repo_list, repo_error) = repos::load();
+        let toast = toast.or(repo_error.map(|text| Toast { text, tone: Tone::Bad, at: Instant::now() }));
         let (events_tx, events_rx) = channel();
         let mut app = Self {
             game: if library.games.is_empty() { None } else { Some(0) },
@@ -161,6 +165,7 @@ impl App {
             events_tx,
             events_rx,
             pending: mods::pending_restores(&launch::backups_root()),
+            repos: repo_list,
             confirm_delete_game: false,
             confirm_delete_profile: false,
             focus_game_name: false,
@@ -288,7 +293,7 @@ impl App {
         let tx = self.events_tx.clone();
         let ctx = self.ctx.clone();
         let (gn, pn) = (game_name.clone(), profile.name.clone());
-        let result = launch::launch(&profile, false, move |info| {
+        let result = launch::launch(&profile, &self.repos, false, move |info| {
             let _ = tx.send(Event::Exited { game: gn, profile: pn, info });
             ctx.request_repaint();
         });
@@ -695,17 +700,91 @@ impl App {
                 if names.iter().enumerate().any(|(i, n)| i != self.profile && *n == p.name) {
                     ui.label(RichText::new("Another profile already has this name").color(AMBER).small());
                 }
-                field_label(ui, "PROGRAM OR URL");
-                changed |= path_field(ui, &mut p.executable, r"C:\Games\MyGame\game.exe  or  steam://rungameid/…", Browse::File);
-                field_label(ui, "ARGUMENTS");
-                changed |= text_field(ui, &mut p.arguments, r#"-windowed -config "{exe_dir}\mods.ini""#, full).changed();
-                field_label(ui, "WORKING FOLDER");
-                changed |= path_field(ui, &mut p.working_dir, "Leave empty to use the program's folder", Browse::Folder);
-                ui.label(
-                    RichText::new("Placeholders {exe_dir} and {profile}, and variables like %APPDATA%, work in every field.")
-                        .color(MUTED)
-                        .small(),
-                );
+                field_label(ui, "HOW TO START IT");
+                ui.horizontal(|ui| {
+                    for (kind, label) in [(LaunchKind::Program, "Program or URL"), (LaunchKind::Repo, "Repo method")] {
+                        let sel = p.kind == kind;
+                        let btn = Button::new(RichText::new(label).color(if sel { Color32::WHITE } else { TEXT }))
+                            .fill(if sel { ACCENT } else { FIELD })
+                            .stroke(Stroke::new(1.0, if sel { ACCENT } else { BORDER }))
+                            .min_size(vec2(150.0, 34.0));
+                        if ui.add(btn).clicked() && !sel {
+                            p.kind = kind;
+                            changed = true;
+                        }
+                    }
+                });
+
+                match p.kind {
+                    LaunchKind::Program => {
+                        field_label(ui, "PROGRAM OR URL");
+                        changed |= path_field(ui, &mut p.executable, r"C:\Games\MyGame\game.exe  or  steam://rungameid/…", Browse::File);
+                        field_label(ui, "ARGUMENTS");
+                        changed |= text_field(ui, &mut p.arguments, r#"-windowed -config "{exe_dir}\mods.ini""#, full).changed();
+                        field_label(ui, "WORKING FOLDER");
+                        changed |= path_field(ui, &mut p.working_dir, "Leave empty to use the program's folder", Browse::Folder);
+                        ui.label(
+                            RichText::new("Placeholders {exe_dir} and {profile}, and variables like %APPDATA%, work in every field.")
+                                .color(MUTED)
+                                .small(),
+                        );
+                    }
+                    LaunchKind::Repo => {
+                        field_label(ui, "GAME FOLDER");
+                        changed |= path_field(ui, &mut p.game_dir, r"C:\Games\MyGame", Browse::Folder);
+
+                        field_label(ui, "REPO");
+                        let current = self.repos.iter().find(|r| r.id == p.repo_id);
+                        let selected_text = match current {
+                            Some(r) => r.name.clone(),
+                            None if p.repo_id.is_empty() => "Choose a repo…".to_string(),
+                            None => format!("Unknown repo '{}'", p.repo_id),
+                        };
+                        egui::ComboBox::from_id_salt("repo_pick")
+                            .width(full)
+                            .selected_text(selected_text)
+                            .show_ui(ui, |ui| {
+                                for r in &self.repos {
+                                    if ui.selectable_value(&mut p.repo_id, r.id.clone(), &r.name).changed() {
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                        if let Some(repo) = self.repos.iter().find(|r| r.id == p.repo_id) {
+                            field_label(ui, "REPO FOLDER (WHERE YOU DOWNLOADED IT)");
+                            changed |= path_field(ui, &mut p.repo_dir, r"C:\Tools\repo-name", Browse::Folder);
+
+                            ui.add_space(6.0);
+                            Frame::new()
+                                .fill(FIELD)
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .corner_radius(CornerRadius::same(10))
+                                .inner_margin(Margin::same(14))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&repo.name).strong().size(16.0));
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if !repo.url.is_empty() {
+                                                ui.hyperlink_to("Open on GitHub ↗", &repo.url);
+                                            }
+                                        });
+                                    });
+                                    ui.label(RichText::new(repo.method.describe()).color(ACCENT_HOVER).small());
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new("INSTRUCTIONS").color(MUTED).small().strong());
+                                    if repo.instructions.trim().is_empty() {
+                                        ui.label(RichText::new("No instructions for this repo yet.").color(MUTED));
+                                    } else {
+                                        ui.label(&repo.instructions);
+                                    }
+                                });
+                        } else if self.repos.is_empty() {
+                            ui.label(RichText::new("The repo list is empty. Add repos to repos.json.").color(AMBER).small());
+                        }
+                    }
+                }
             });
 
             ui.add_space(12.0);

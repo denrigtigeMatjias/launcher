@@ -4,6 +4,7 @@
 mod launch;
 mod model;
 mod mods;
+mod repos;
 mod storage;
 mod ui;
 
@@ -63,7 +64,7 @@ fn cli(args: &[String]) -> anyhow::Result<ExitCode> {
                 None => game.default().ok_or_else(|| anyhow::anyhow!("{} has no profiles", game.name))?,
             };
             let (tx, rx) = std::sync::mpsc::channel();
-            launch::launch(profile, true, move |info| {
+            launch::launch(profile, &repos::load().0, true, move |info| {
                 let _ = tx.send(info);
             })?;
             let info = rx.recv()?;

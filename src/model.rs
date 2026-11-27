@@ -9,6 +9,17 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// How a profile starts the game.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchKind {
+    /// Run `executable` (a program or a launcher URL) directly.
+    #[default]
+    Program,
+    /// Use a repo from the repo list and its launch method.
+    Repo,
+}
+
 /// One way of starting a game.
 ///
 /// `executable` is a path to a program (game .exe, mod loader, emulator) or a
@@ -17,6 +28,7 @@ pub struct EnvVar {
 #[serde(default)]
 pub struct Profile {
     pub name: String,
+    pub kind: LaunchKind,
     pub executable: String,
     pub arguments: String,
     pub working_dir: String,
@@ -27,12 +39,18 @@ pub struct Profile {
     /// Put the original files back when the game exits.
     pub restore_mods: bool,
     pub notes: String,
+    /// For `LaunchKind::Repo`: which repo, the game folder, and the folder
+    /// the repo was downloaded to.
+    pub repo_id: String,
+    pub game_dir: String,
+    pub repo_dir: String,
 }
 
 impl Default for Profile {
     fn default() -> Self {
         Self {
             name: "Default".into(),
+            kind: LaunchKind::Program,
             executable: String::new(),
             arguments: String::new(),
             working_dir: String::new(),
@@ -41,6 +59,9 @@ impl Default for Profile {
             mod_target: String::new(),
             restore_mods: true,
             notes: String::new(),
+            repo_id: String::new(),
+            game_dir: String::new(),
+            repo_dir: String::new(),
         }
     }
 }
