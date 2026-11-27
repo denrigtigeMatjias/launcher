@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 
 use crate::model::Library;
 
-/// Folder for the library file and mod backups.
+/// Folder for the library, the repo list, your scripts, and the repos the
+/// launcher has fetched.
 ///
 /// Windows: `%APPDATA%\GameLauncher`. Elsewhere: `~/.config/gamelauncher`.
 /// `GAMELAUNCHER_HOME` overrides both (handy for a portable setup).
@@ -75,7 +76,7 @@ pub fn save(library: &Library) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EnvVar, Game, Profile};
+    use crate::model::{Game, Profile};
 
     #[test]
     fn round_trip() {
@@ -83,7 +84,8 @@ mod tests {
         let path = dir.path().join("lib.json");
         let mut game = Game::new("G");
         game.profiles.push(Profile {
-            env: vec![EnvVar { key: "X".into(), value: "1".into() }],
+            repo_id: "example-bat".into(),
+            game_dir: r"C:\Games\G".into(),
             ..Profile::named("B")
         });
         game.default_profile = "B".into();
