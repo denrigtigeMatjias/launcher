@@ -1,48 +1,51 @@
-# Game Launcher
+# Launcher
 
-A small desktop launcher for switching between launch profiles of games you own
-or are making. Each game has any number of profiles, and each profile says how
-to start it:
+A fast, native desktop launcher for switching between launch profiles of games
+you own or are making. Written in Rust with [egui](https://github.com/emilk/egui).
+
+![Screenshot](docs/screenshot.png)
+
+Each game has any number of profiles (vanilla, modded, debug build, an
+emulator with different settings…), and switching is one click. A profile
+says how to start the game:
 
 - **Program or URL**: a game `.exe`, a mod loader, an emulator, or a launcher
   URL like `steam://rungameid/489830`.
 - **Arguments**: typed like on the Windows command line. Quotes group words,
   backslashes are kept.
 - **Working folder**: defaults to the program's folder.
-- **Environment variables**: `KEY=VALUE`, one per line.
-- **Mod overlay** (optional): files in a mod folder are copied over the game
-  folder before launch. Originals are backed up and put back when the game
-  closes. If the launcher is closed or crashes first, it offers to put them
-  back the next time it opens (or run `gamelauncher restore-mods`).
+- **Environment variables** for that profile only.
+- **Mods** (optional): files in a mod folder are copied over the game folder
+  before launch. Originals are backed up and put back when the game closes.
+  If the launcher is closed or crashes first, it offers to put them back the
+  next time it opens (or run `gamelauncher restore-mods`).
 
-Placeholders `{exe_dir}` and `{profile}` and environment variables
-(`%APPDATA%`, `$HOME`) work in arguments, the working folder and env values.
+Placeholders `{exe_dir}` and `{profile}` and variables like `%APPDATA%` or
+`$HOME` work in arguments, the working folder and env values.
 
-![Screenshot](docs/screenshot.png)
+The ★ profile is the game's default. Changes save automatically.
 
-## Running it
+## Build
 
-Needs Python 3.10 or newer. The Windows installer from python.org includes
-Tkinter, which the window uses. There are no other dependencies.
+Needs [Rust](https://rustup.rs) (stable).
 
 ```
-pip install .
-gamelauncher            # opens the window
+cargo run --release            # open the window
+cargo build --release          # target/release/gamelauncher(.exe)
+cargo test
 ```
-
-Or without installing: `python -m gamelauncher` from the `src` folder.
 
 ## Command line and shortcuts
 
 ```
 gamelauncher list
-gamelauncher run "My Game"                  # default profile (★ in the window)
-gamelauncher run "My Game" "Modded"         # a specific profile
+gamelauncher run "My Game"              # default profile
+gamelauncher run "My Game" "Modded"     # a specific profile
 gamelauncher restore-mods
 ```
 
 To make a desktop shortcut for one profile, point it at
-`pythonw -m gamelauncher run "My Game" "Modded"`.
+`gamelauncher.exe run "My Game" "Modded"`.
 
 ## Where settings live
 
@@ -52,7 +55,6 @@ to the launcher for a portable setup.
 
 ## Notes
 
-- Profiles that launch a URL hand the game to Steam/Epic, so the launcher
-  cannot tell when the game closes. Mod files for those profiles stay in place
+- Profiles that start from a URL hand the game to Steam/Epic, so the launcher
+  can't tell when the game closes. Mod files for those profiles stay in place
   until you restore them.
-- Tests: `pip install pytest && pytest`.
