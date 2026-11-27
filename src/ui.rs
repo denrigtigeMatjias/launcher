@@ -433,6 +433,59 @@ fn path_field(ui: &mut Ui, value: &mut String, hint: &str, browse: Browse) -> bo
     changed
 }
 
+/// A big clickable card with a title and a short description, used to pick
+/// one option out of several. Returns the click response.
+fn option_card(ui: &mut Ui, selected: bool, title: &str, subtitle: &str, size: Vec2) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = resp.hovered();
+    let fill = if selected {
+        Color32::from_rgb(36, 31, 66)
+    } else if hovered {
+        Color32::from_rgb(30, 35, 46)
+    } else {
+        FIELD
+    };
+    let stroke = if selected {
+        Stroke::new(2.0, ACCENT)
+    } else if hovered {
+        Stroke::new(1.0, Color32::from_rgb(70, 78, 98))
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(12), fill);
+    painter.rect_stroke(rect, CornerRadius::same(12), stroke, egui::StrokeKind::Inside);
+
+    // radio dot in the top-right corner
+    let dot = egui::pos2(rect.right() - 20.0, rect.top() + 20.0);
+    painter.circle_stroke(dot, 8.0, Stroke::new(1.5, if selected { ACCENT } else { BORDER }));
+    if selected {
+        painter.circle_filled(dot, 4.5, ACCENT);
+    }
+
+    let inner = rect.shrink2(vec2(16.0, 14.0));
+    let title_galley = painter.layout(
+        ellipsize(title, 40),
+        FontId::proportional(16.0),
+        if selected { Color32::WHITE } else { TEXT },
+        inner.width() - 28.0,
+    );
+    let title_h = title_galley.size().y;
+    painter.galley(inner.min, title_galley, TEXT);
+    let sub_galley = painter.layout(subtitle.to_string(), FontId::proportional(12.5), MUTED, inner.width());
+    painter.galley(inner.min + vec2(0.0, title_h + 6.0), sub_galley, MUTED);
+
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Width for each card so `n` of them fill a row (2 or 3 per row).
+fn card_width(ui: &Ui, n: usize) -> (f32, usize) {
+    let full = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    let cols = if full > 760.0 { 3 } else { 2 }.min(n.max(1));
+    ((full - gap * (cols as f32 - 1.0)) / cols as f32 - 0.5, cols)
+}
+
 fn primary_button(text: impl Into<String>, size: Vec2) -> Button<'static> {
     Button::new(RichText::new(text.into()).color(Color32::WHITE).strong().size(16.0))
         .fill(ACCENT)
@@ -702,13 +755,13 @@ impl App {
                 }
                 field_label(ui, "HOW TO START IT");
                 ui.horizontal(|ui| {
-                    for (kind, label) in [(LaunchKind::Program, "Program or URL"), (LaunchKind::Repo, "Repo method")] {
-                        let sel = p.kind == kind;
-                        let btn = Button::new(RichText::new(label).color(if sel { Color32::WHITE } else { TEXT }))
-                            .fill(if sel { ACCENT } else { FIELD })
-                            .stroke(Stroke::new(1.0, if sel { ACCENT } else { BORDER }))
-                            .min_size(vec2(150.0, 34.0));
-                        if ui.add(btn).clicked() && !sel {
+                    let (w, _) = card_width(ui, 2);
+                    let w = w.max(200.0).min((ui.available_width() - 8.0) / 2.0);
+                    for (kind, title, sub) in [
+                        (LaunchKind::Program, "Program or URL", "Run a game .exe, mod loader, emulator, or a Steam/Epic link"),
+                        (LaunchKind::Repo, "Repo method", "Pick your game folder and a repo from the list, then follow its instructions"),
+                    ] {
+                        if option_card(ui, p.kind == kind, title, sub, vec2(w, 80.0)).clicked() && p.kind != kind {
                             p.kind = kind;
                             changed = true;
                         }
@@ -733,23 +786,28 @@ impl App {
                         field_label(ui, "GAME FOLDER");
                         changed |= path_field(ui, &mut p.game_dir, r"C:\Games\MyGame", Browse::Folder);
 
-                        field_label(ui, "REPO");
-                        let current = self.repos.iter().find(|r| r.id == p.repo_id);
-                        let selected_text = match current {
-                            Some(r) => r.name.clone(),
-                            None if p.repo_id.is_empty() => "Choose a repo…".to_string(),
-                            None => format!("Unknown repo '{}'", p.repo_id),
-                        };
-                        egui::ComboBox::from_id_salt("repo_pick")
-                            .width(full)
-                            .selected_text(selected_text)
-                            .show_ui(ui, |ui| {
-                                for r in &self.repos {
-                                    if ui.selectable_value(&mut p.repo_id, r.id.clone(), &r.name).changed() {
+                        field_label(ui, "CHOOSE A REPO");
+                        if !p.repo_id.is_empty() && !self.repos.iter().any(|r| r.id == p.repo_id) {
+                            ui.label(
+                                RichText::new(format!("This profile used '{}', which is no longer in the list. Pick another.", p.repo_id))
+                                    .color(AMBER)
+                                    .small(),
+                            );
+                        }
+                        let (w, cols) = card_width(ui, self.repos.len());
+                        for row in self.repos.chunks(cols) {
+                            ui.horizontal(|ui| {
+                                for r in row {
+                                    let sub = r.method.describe();
+                                    if option_card(ui, p.repo_id == r.id, &r.name, &sub, vec2(w, 82.0)).clicked()
+                                        && p.repo_id != r.id
+                                    {
+                                        p.repo_id = r.id.clone();
                                         changed = true;
                                     }
                                 }
                             });
+                        }
 
                         if let Some(repo) = self.repos.iter().find(|r| r.id == p.repo_id) {
                             field_label(ui, "REPO FOLDER (WHERE YOU DOWNLOADED IT)");
