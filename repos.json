@@ -1,0 +1,28 @@
+{
+  "_help": "The repos shown in the dropdown. See README.md (Repo list) for every field. The two entries below are placeholders: replace them with your own.",
+  "repos": [
+    {
+      "id": "example-bat",
+      "name": "Example: .bat method",
+      "url": "https://github.com/owner/example-tool",
+      "method": {
+        "type": "bat",
+        "file": "launch.bat",
+        "args": "\"{game_dir}\""
+      },
+      "instructions": "1. Download or clone the repo.\n2. Pick the folder you downloaded it to under 'Repo folder'.\n3. Press Play. The launcher opens launch.bat from that folder and passes it your game folder."
+    },
+    {
+      "id": "example-copy",
+      "name": "Example: copy and run method",
+      "url": "https://github.com/owner/example-tool",
+      "method": {
+        "type": "copy_and_run",
+        "copy": ["bin/loader.exe"],
+        "run": "loader.exe",
+        "args": ""
+      },
+      "instructions": "1. Download the latest release of the repo.\n2. Pick the folder you unpacked it to under 'Repo folder'.\n3. Press Play. The launcher copies loader.exe into your game folder and runs it from there."
+    }
+  ]
+}
