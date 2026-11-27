@@ -1,28 +1,66 @@
 {
-  "_help": "The repos shown in the dropdown. See README.md (Repo list) for every field. The two entries below are placeholders: replace them with your own.",
+  "_help": "The repos shown in the launcher's repo dropdown. Each entry carries its own method, so the method is chosen here and never in the window: 'bat' clones the repo and runs one of your scripts from the scripts folder, 'copy_and_run' downloads the named files from the repo's newest GitHub release. Entries that share a 'url' share one clone, so a repo with several launch scripts costs one download and one build. See README.md (Repo list) for every field.",
   "repos": [
     {
-      "id": "example-bat",
-      "name": "Example: .bat method",
-      "url": "https://github.com/owner/example-tool",
+      "id": "victory",
+      "name": "VIctory",
+      "description": "Runs the title through the VIctory loader (NVIDIA, 8 GB cards)",
+      "url": "https://git.gtahub.st/github/DoubleGhosty--cool_fox.git",
       "method": {
         "type": "bat",
-        "file": "launch.bat",
-        "args": "\"{game_dir}\""
+        "file": "victory.bat",
+        "args": "Play-VIctory.cmd"
       },
-      "instructions": "1. Download or clone the repo.\n2. Pick the folder you downloaded it to under 'Repo folder'.\n3. Press Play. The launcher opens launch.bat from that folder and passes it your game folder."
+      "instructions": "Pick the folder that holds game_scarlett_master.exe and press Play.\nThe launcher clones cool_fox, builds it with cargo (the first Play takes a while), and runs Play-VIctory.cmd with VICTORY_GAME_DIR set to your game folder."
     },
     {
-      "id": "example-copy",
-      "name": "Example: copy and run method",
-      "url": "https://github.com/owner/example-tool",
+      "id": "victory-belobug",
+      "name": "Victory Belobug",
+      "description": "AMD fork, built from source and started by its own play script",
+      "url": "https://git.gtahub.st/github/Belobug--VIctory-Belobug-AMD.git",
+      "method": {
+        "type": "bat",
+        "file": "victory-belobug.bat",
+        "args": "game_scarlett_master.exe"
+      },
+      "instructions": "Pick the folder that holds your copy of the title and press Play.\nThe launcher clones the fork, builds it with cargo (diag profile, the first Play takes a while) and runs scripts\\play.ps1 with your title's executable. Needs Rust and the MSVC build tools."
+    },
+    {
+      "id": "victory-nvidia",
+      "name": "Victory Nvidia",
+      "description": "Prebuilt NVIDIA build, run from inside the game folder",
+      "url": "https://github.com/trustno1-coder/VIctory-NVIDIA",
       "method": {
         "type": "copy_and_run",
-        "copy": ["bin/loader.exe"],
-        "run": "loader.exe",
+        "assets": ["victory.exe"],
+        "run": "victory.exe",
         "args": ""
       },
-      "instructions": "1. Download the latest release of the repo.\n2. Pick the folder you unpacked it to under 'Repo folder'.\n3. Press Play. The launcher copies loader.exe into your game folder and runs it from there."
+      "instructions": "Pick the folder that holds game_scarlett_master.exe and press Play.\nThe launcher downloads victory.exe from the newest release, puts it beside the game and runs it there, then takes it out again when you close the game. Nothing to build."
+    },
+    {
+      "id": "victory-4gb",
+      "name": "VIctory (4 GB)",
+      "description": "Same loader, tuned for 4 GB graphics cards",
+      "url": "https://git.gtahub.st/github/DoubleGhosty--cool_fox.git",
+      "method": {
+        "type": "bat",
+        "file": "victory.bat",
+        "args": "Play-VIctory-4GB.cmd"
+      },
+      "instructions": "As VIctory, but runs Play-VIctory-4GB.cmd. Shares the clone and the build with the other VIctory entries."
+    },
+    {
+      "id": "victory-amd",
+      "name": "VIctory (AMD)",
+      "description": "Same loader, tuned for AMD Radeon RX 7000+ with 16 GB or more",
+      "url": "https://git.gtahub.st/github/DoubleGhosty--cool_fox.git",
+      "method": {
+        "type": "bat",
+        "file": "victory.bat",
+        "args": "Play-VIctory-AMD.cmd"
+      },
+      "instructions": "As VIctory, but runs Play-VIctory-AMD.cmd. Shares the clone and the build with the other VIctory entries."
     }
   ]
 }

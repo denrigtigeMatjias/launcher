@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Button, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText,
-    ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2, vec2,
+    ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2, text::LayoutJob, vec2,
 };
 
-use crate::launch::{self, ExitInfo};
-use crate::model::{EnvVar, Game, LaunchKind, Library, Profile, unique_name};
+use crate::fetch;
+use crate::icons::{self, Icon};
+use crate::launch;
+use crate::model::{Game, Library, Profile, unique_name};
 use crate::repos::{self, Repo};
-use crate::{mods, storage};
+use crate::storage;
 
 // ---------- palette ----------
 const BG: Color32 = Color32::from_rgb(13, 15, 20);
@@ -39,6 +41,7 @@ pub fn run() -> eframe::Result {
 }
 
 pub fn apply_theme(ctx: &egui::Context) {
+    icons::install(ctx);
     ctx.set_visuals(egui::Visuals::dark());
     ctx.all_styles_mut(|style| {
         use FontId as F;
@@ -108,7 +111,13 @@ struct Running {
 }
 
 enum Event {
-    Exited { game: String, profile: String, info: ExitInfo },
+    /// A line of progress from a download.
+    Status(String),
+    /// A repo was fetched (or not) by the Update button.
+    Updated { repo: String, error: Option<String> },
+    /// A profile was fetched and started (or not).
+    Launched { game: String, profile: String, error: Option<String> },
+    Exited { game: String, profile: String, code: Option<i32> },
 }
 
 enum Action {
@@ -123,7 +132,7 @@ enum Action {
     DeleteProfile,
     MakeDefault,
     Play,
-    RestorePending,
+    UpdateRepo(String),
 }
 
 pub struct App {
@@ -135,7 +144,8 @@ pub struct App {
     running: Vec<Running>,
     events_tx: Sender<Event>,
     events_rx: Receiver<Event>,
-    pending: Vec<mods::Overlay>,
+    /// What a worker thread is doing right now, if anything.
+    busy: Option<String>,
     repos: Vec<Repo>,
     confirm_delete_game: bool,
     confirm_delete_profile: bool,
@@ -166,7 +176,7 @@ impl App {
             running: vec![],
             events_tx,
             events_rx,
-            pending: mods::pending_restores(&launch::backups_root()),
+            busy: None,
             repos: repo_list,
             confirm_delete_game: false,
             confirm_delete_profile: false,
@@ -183,7 +193,6 @@ impl App {
     pub fn with_library(ctx: &egui::Context, library: Library, game: usize, profile: usize) -> Self {
         let mut app = Self::new(ctx);
         app.library = library;
-        app.pending.clear();
         app.select_game(Some(game));
         app.profile = profile;
         app
@@ -283,22 +292,18 @@ impl App {
                 }
             }
             Action::Play => self.play(),
-            Action::RestorePending => {
-                let mut failed = 0;
-                for o in std::mem::take(&mut self.pending) {
-                    if mods::restore_overlay(&o).is_err() {
-                        failed += 1;
-                    }
-                }
-                if failed == 0 {
-                    self.toast("Original game files restored", Tone::Good);
-                } else {
-                    self.toast(format!("{failed} folder(s) could not be restored"), Tone::Bad);
+            Action::UpdateRepo(id) => {
+                if let Some(repo) = self.repos.iter().find(|r| r.id == id).cloned() {
+                    self.update_repo(repo);
                 }
             }
         }
     }
 
+    /// Fetch whatever the profile's repo needs, then start it.
+    ///
+    /// Both happen on a worker thread: a first launch clones a repo or
+    /// downloads a release, which is far too slow to do between frames.
     fn play(&mut self) {
         let Some(g) = self.game else { return };
         let game = &self.library.games[g];
@@ -306,34 +311,88 @@ impl App {
         let game_name = game.name.clone();
         self.save_now();
 
+        let Some(repo) = self.repos.iter().find(|r| r.id == profile.repo_id).cloned() else {
+            self.toast(format!("Pick a repo for '{}'", profile.name), Tone::Bad);
+            return;
+        };
+        let repos = self.repos.clone();
         let tx = self.events_tx.clone();
         let ctx = self.ctx.clone();
-        let (gn, pn) = (game_name.clone(), profile.name.clone());
-        let result = launch::launch(&profile, &self.repos, false, move |info| {
-            let _ = tx.send(Event::Exited { game: gn, profile: pn, info });
+        self.busy = Some(format!("Starting {game_name}…"));
+
+        std::thread::spawn(move || {
+            let say = |line: String| {
+                let _ = tx.send(Event::Status(line));
+                ctx.request_repaint();
+            };
+            let error = match fetch::ensure(&repo, false, &say) {
+                Err(e) => Some(format!("{e:#}")),
+                Ok(_) => {
+                    let (exit_tx, exit_ctx) = (tx.clone(), ctx.clone());
+                    let (gn, pn) = (game_name.clone(), profile.name.clone());
+                    launch::launch(&profile, &repos, false, move |code| {
+                        let _ = exit_tx.send(Event::Exited { game: gn, profile: pn, code });
+                        exit_ctx.request_repaint();
+                    })
+                    .err()
+                    .map(|e| format!("{e:#}"))
+                }
+            };
+            let _ = tx.send(Event::Launched { game: game_name, profile: profile.name, error });
             ctx.request_repaint();
         });
-        match result {
-            Ok(()) => {
-                self.running.push(Running { game: game_name.clone(), profile: profile.name.clone() });
-                self.toast(format!("Starting {game_name} · {}", profile.name), Tone::Good);
-            }
-            Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
-        }
+    }
+
+    /// Fetch a repo again, newest version, on a worker thread.
+    fn update_repo(&mut self, repo: Repo) {
+        let tx = self.events_tx.clone();
+        let ctx = self.ctx.clone();
+        self.busy = Some(format!("Updating {}…", repo.name));
+        std::thread::spawn(move || {
+            let say = |line: String| {
+                let _ = tx.send(Event::Status(line));
+                ctx.request_repaint();
+            };
+            let error = fetch::ensure(&repo, true, &say).err().map(|e| format!("{e:#}"));
+            let _ = tx.send(Event::Updated { repo: repo.name, error });
+            ctx.request_repaint();
+        });
     }
 
     fn handle_events(&mut self) {
-        while let Ok(Event::Exited { game, profile, info }) = self.events_rx.try_recv() {
-            if let Some(i) = self.running.iter().position(|r| r.game == game && r.profile == profile) {
-                self.running.remove(i);
-            }
-            if let Some(err) = info.restore_error {
-                self.toast(format!("{game} closed, but mod files could not be restored: {err}"), Tone::Bad);
-                self.pending = mods::pending_restores(&launch::backups_root());
-            } else if let Some(code) = info.code.filter(|c| *c != 0) {
-                self.toast(format!("{game} closed with exit code {code}"), Tone::Bad);
-            } else if info.code.is_some() {
-                self.toast(format!("{game} closed"), Tone::Info);
+        while let Ok(event) = self.events_rx.try_recv() {
+            match event {
+                Event::Status(line) => {
+                    self.busy = Some(line.clone());
+                    self.toast(line, Tone::Info);
+                }
+                Event::Updated { repo, error } => {
+                    self.busy = None;
+                    match error {
+                        Some(e) => self.toast(e, Tone::Bad),
+                        None => self.toast(format!("{repo} is up to date"), Tone::Good),
+                    }
+                }
+                Event::Launched { game, profile, error } => {
+                    self.busy = None;
+                    match error {
+                        Some(e) => self.toast(e, Tone::Bad),
+                        None => {
+                            self.toast(format!("Starting {game} · {profile}"), Tone::Good);
+                            self.running.push(Running { game, profile });
+                        }
+                    }
+                }
+                Event::Exited { game, profile, code } => {
+                    if let Some(i) = self.running.iter().position(|r| r.game == game && r.profile == profile) {
+                        self.running.remove(i);
+                    }
+                    if let Some(code) = code.filter(|c| *c != 0) {
+                        self.toast(format!("{game} closed with exit code {code}"), Tone::Bad);
+                    } else {
+                        self.toast(format!("{game} closed"), Tone::Info);
+                    }
+                }
             }
         }
     }
@@ -421,96 +480,34 @@ fn text_field(ui: &mut Ui, value: &mut String, hint: &str, width: f32) -> egui::
     )
 }
 
-enum Browse {
-    File,
-    Folder,
-}
-
-/// A text field with a Browse button. Returns true if the value changed.
-fn path_field(ui: &mut Ui, value: &mut String, hint: &str, browse: Browse) -> bool {
+/// A text field for a folder, with a Browse button. Returns true if the
+/// value changed.
+fn folder_field(ui: &mut Ui, value: &mut String, hint: &str) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         let w = ui.available_width() - 96.0;
         changed |= text_field(ui, value, hint, w).changed();
-        if ui.add(Button::new("Browse").min_size(vec2(88.0, 34.0))).clicked() {
-            let picked = match browse {
-                Browse::File => rfd::FileDialog::new()
-                    .add_filter("Programs", &["exe", "bat", "cmd", "lnk"])
-                    .add_filter("All files", &["*"])
-                    .pick_file(),
-                Browse::Folder => rfd::FileDialog::new().pick_folder(),
-            };
-            if let Some(p) = picked {
-                *value = p.to_string_lossy().into_owned();
-                changed = true;
-            }
+        if ui.add(Button::new(icons::FOLDER.with_text(14.0, "Browse", FontId::proportional(15.0), TEXT)).min_size(vec2(96.0, 34.0))).clicked()
+            && let Some(p) = rfd::FileDialog::new().pick_folder()
+        {
+            *value = p.to_string_lossy().into_owned();
+            changed = true;
         }
     });
     changed
 }
 
-/// A big clickable card with a title and a short description, used to pick
-/// one option out of several. Returns the click response.
-fn option_card(ui: &mut Ui, selected: bool, title: &str, subtitle: &str, size: Vec2) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let hovered = resp.hovered();
-    let fill = if selected {
-        Color32::from_rgb(36, 31, 66)
-    } else if hovered {
-        Color32::from_rgb(30, 35, 46)
-    } else {
-        FIELD
-    };
-    let stroke = if selected {
-        Stroke::new(2.0, ACCENT)
-    } else if hovered {
-        Stroke::new(1.0, Color32::from_rgb(70, 78, 98))
-    } else {
-        Stroke::new(1.0, BORDER)
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(12), fill);
-    painter.rect_stroke(rect, CornerRadius::same(12), stroke, egui::StrokeKind::Inside);
-
-    // radio dot in the top-right corner
-    let dot = egui::pos2(rect.right() - 20.0, rect.top() + 20.0);
-    painter.circle_stroke(dot, 8.0, Stroke::new(1.5, if selected { ACCENT } else { BORDER }));
-    if selected {
-        painter.circle_filled(dot, 4.5, ACCENT);
-    }
-
-    let inner = rect.shrink2(vec2(16.0, 14.0));
-    let title_galley = painter.layout(
-        ellipsize(title, 40),
-        FontId::proportional(16.0),
-        if selected { Color32::WHITE } else { TEXT },
-        inner.width() - 28.0,
-    );
-    let title_h = title_galley.size().y;
-    painter.galley(inner.min, title_galley, TEXT);
-    let sub_galley = painter.layout(subtitle.to_string(), FontId::proportional(12.5), MUTED, inner.width());
-    painter.galley(inner.min + vec2(0.0, title_h + 6.0), sub_galley, MUTED);
-
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// Width for each card so `n` of them fill a row (2 or 3 per row).
-fn card_width(ui: &Ui, n: usize) -> (f32, usize) {
-    let full = ui.available_width();
-    let gap = ui.spacing().item_spacing.x;
-    let cols = if full > 760.0 { 3 } else { 2 }.min(n.max(1));
-    ((full - gap * (cols as f32 - 1.0)) / cols as f32 - 0.5, cols)
-}
-
-fn primary_button(text: impl Into<String>, size: Vec2) -> Button<'static> {
-    Button::new(RichText::new(text.into()).color(Color32::WHITE).strong().size(16.0))
+/// A filled accent button: an icon, then its label, centred together.
+fn primary_button(icon: Icon, text: &str, size: Vec2) -> Button<'static> {
+    Button::new(icon.with_text(17.0, text, FontId::proportional(16.0), Color32::WHITE))
         .fill(ACCENT)
         .corner_radius(CornerRadius::same(12))
         .min_size(size)
 }
 
-fn ghost_button(text: impl Into<String>, color: Color32) -> Button<'static> {
-    Button::new(RichText::new(text.into()).color(color)).frame(false)
+/// A frameless text button, with an icon in front of it if one is given.
+fn ghost_button(icon: Icon, text: &str, color: Color32) -> Button<'static> {
+    Button::new(icon.with_text(14.0, text, FontId::proportional(15.0), color)).frame(false)
 }
 
 fn add_tile(ui: &mut Ui, size: Vec2, actions: &mut Vec<Action>) {
@@ -520,9 +517,10 @@ fn add_tile(ui: &mut Ui, size: Vec2, actions: &mut Vec<Action>) {
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(14), if hovered { Color32::from_rgb(26, 24, 44) } else { BG });
     painter.rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.5, color), egui::StrokeKind::Inside);
+    let label = if hovered { TEXT } else { MUTED };
     painter.circle_stroke(rect.center() - vec2(0.0, 14.0), 22.0, Stroke::new(1.5, color));
-    painter.text(rect.center() - vec2(0.0, 14.0), Align2::CENTER_CENTER, "＋", FontId::proportional(22.0), if hovered { TEXT } else { MUTED });
-    painter.text(rect.center() + vec2(0.0, 26.0), Align2::CENTER_CENTER, "Add game", FontId::proportional(14.0), if hovered { TEXT } else { MUTED });
+    painter.text(rect.center() - vec2(0.0, 14.0), Align2::CENTER_CENTER, icons::ADD.as_str(), icons::font(20.0), label);
+    painter.text(rect.center() + vec2(0.0, 26.0), Align2::CENTER_CENTER, "Add game", FontId::proportional(14.0), label);
     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
         actions.push(Action::AddGame);
     }
@@ -563,37 +561,11 @@ fn paint_banner(ui: &Ui, rect: egui::Rect, color: Color32) {
 // ---------- panels ----------
 
 impl App {
-    fn pending_banner(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        if !self.pending.is_empty() {
-            Frame::new()
-                .fill(Color32::from_rgb(52, 40, 18))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(110, 80, 30)))
-                .corner_radius(CornerRadius::same(12))
-                .inner_margin(Margin::symmetric(16, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let folders: Vec<String> =
-                            self.pending.iter().map(|o| o.target.to_string_lossy().into_owned()).collect();
-                        ui.label(RichText::new("⚠").color(AMBER).size(18.0));
-                        ui.label(RichText::new(format!("Mod files are still applied in {}", folders.join(", "))).color(AMBER));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Restore originals").clicked() {
-                                actions.push(Action::RestorePending);
-                            }
-                        });
-                    });
-                });
-            ui.add_space(10.0);
-        }
-
-    }
-
     fn library_view(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
             ui.painter().rect_filled(rect, CornerRadius::same(10), ACCENT);
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "▶", FontId::proportional(16.0), Color32::WHITE);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, icons::GAME.as_str(), icons::font(18.0), Color32::WHITE);
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.label(RichText::new("Library").size(26.0));
@@ -601,13 +573,14 @@ impl App {
                 ui.label(RichText::new(format!("{n} game{}", if n == 1 { "" } else { "s" })).color(MUTED).small());
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if !self.library.games.is_empty() && ui.add(primary_button("＋  Add game", vec2(150.0, 42.0))).clicked() {
+                if !self.library.games.is_empty()
+                    && ui.add(primary_button(icons::ADD, "Add game", vec2(150.0, 42.0))).clicked()
+                {
                     actions.push(Action::AddGame);
                 }
             });
         });
         ui.add_space(16.0);
-        self.pending_banner(ui, actions);
 
         if self.library.games.is_empty() {
             self.empty_state(ui, actions);
@@ -665,9 +638,10 @@ impl App {
 
         let running = self.is_running(&game.name, None);
         if running {
-            let badge = egui::Rect::from_min_size(art.min + vec2(10.0, 10.0), vec2(84.0, 24.0));
+            let badge = egui::Rect::from_min_size(art.min + vec2(10.0, 10.0), vec2(86.0, 24.0));
             painter.rect_filled(badge, CornerRadius::same(12), Color32::from_black_alpha(170));
-            painter.text(badge.center(), Align2::CENTER_CENTER, "● Running", FontId::proportional(12.5), GREEN);
+            painter.circle_filled(badge.left_center() + vec2(14.0, 0.0), 4.0, GREEN);
+            painter.text(badge.left_center() + vec2(24.0, 0.0), Align2::LEFT_CENTER, "Running", FontId::proportional(12.5), GREEN);
         }
 
         // quick play button on hover
@@ -677,7 +651,7 @@ impl App {
         if hovered && !running {
             painter.rect_filled(art, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, Color32::from_black_alpha(90));
             painter.circle_filled(play_center, play_r, if over_play { ACCENT_HOVER } else { ACCENT });
-            painter.text(play_center + vec2(2.0, 0.0), Align2::CENTER_CENTER, "▶", FontId::proportional(22.0), Color32::WHITE);
+            painter.text(play_center, Align2::CENTER_CENTER, icons::PLAY.as_str(), icons::font(22.0), Color32::WHITE);
         }
 
         // name and details
@@ -690,10 +664,12 @@ impl App {
         );
         let default = game.default().map(|p| p.name.as_str()).unwrap_or("-");
         let n = game.profiles.len();
+        let meta = egui::pos2(rect.left() + 14.0, art.bottom() + 46.0);
+        painter.text(meta, Align2::LEFT_CENTER, icons::STAR_FILL.as_str(), icons::font(11.0), AMBER);
         painter.text(
-            egui::pos2(rect.left() + 14.0, art.bottom() + 46.0),
+            meta + vec2(17.0, 0.0),
             Align2::LEFT_CENTER,
-            ellipsize(&format!("★ {default} · {n} profile{}", if n == 1 { "" } else { "s" }), ((rect.width() - 28.0) / 6.5) as usize),
+            ellipsize(&format!("{default} · {n} profile{}", if n == 1 { "" } else { "s" }), ((rect.width() - 45.0) / 6.5) as usize),
             FontId::proportional(12.5),
             MUTED,
         );
@@ -717,18 +693,18 @@ impl App {
             ui.add_space(ui.available_height() * 0.28);
             let (rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
             ui.painter().rect_filled(rect, CornerRadius::same(18), ACCENT);
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "▶", FontId::proportional(28.0), Color32::WHITE);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, icons::GAME.as_str(), icons::font(30.0), Color32::WHITE);
             ui.add_space(8.0);
             ui.heading("Add your first game");
             ui.label(
                 RichText::new(
-                    "Give each game as many launch profiles as you like: vanilla, modded,\n\
-                     debug builds, an emulator with different settings. Switch with one click.",
+                    "Give each game as many launch profiles as you like: one per repo,\n\
+                     or per install folder. Switch with one click.",
                 )
                 .color(MUTED),
             );
             ui.add_space(16.0);
-            if ui.add(primary_button("＋  Add game", vec2(180.0, 46.0))).clicked() {
+            if ui.add(primary_button(icons::ADD, "Add game", vec2(180.0, 46.0))).clicked() {
                 actions.push(Action::AddGame);
             }
         });
@@ -745,8 +721,10 @@ impl App {
         let current_profile_name =
             self.library.games[g].profiles.get(self.profile).map(|p| p.name.clone()).unwrap_or_default();
         let running_profile = self.is_running(&game_name_before, Some(&current_profile_name));
+        // a download or a launch is under way, so don't start a second one
+        let busy = self.busy.is_some();
 
-        if ui.add(ghost_button("←  Library", MUTED)).clicked() {
+        if ui.add(ghost_button(icons::BACK, "Library", MUTED)).clicked() {
             actions.push(Action::ShowLibrary);
         }
         ui.add_space(4.0);
@@ -776,23 +754,31 @@ impl App {
                         changed = true;
                     }
                     let status = if running_game {
-                        RichText::new("● Running").color(GREEN)
+                        icons::DOT.with_text(11.0, "Running", FontId::proportional(15.0), GREEN)
                     } else {
                         let default = default_idx.map(|i| game.profiles[i].name.clone()).unwrap_or_default();
-                        RichText::new(format!(
+                        let text = format!(
                             "{profile_count} profile{} · default: {default}",
                             if profile_count == 1 { "" } else { "s" }
-                        ))
-                        .color(Color32::from_rgb(200, 205, 215))
+                        );
+                        icons::NONE.with_text(
+                            0.0,
+                            &text,
+                            FontId::proportional(15.0),
+                            Color32::from_rgb(200, 205, 215),
+                        )
                     };
                     ui.label(status);
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let label = if running_profile { "●  Running" } else { "▶  Play" };
-                    let btn = primary_button(label, vec2(170.0, 54.0));
+                    let btn = if running_profile {
+                        primary_button(icons::DOT, "Running", vec2(170.0, 54.0))
+                    } else {
+                        primary_button(icons::PLAY, "Play", vec2(170.0, 54.0))
+                    };
                     let btn = if running_profile { btn.fill(Color32::from_rgb(40, 120, 85)) } else { btn };
                     let resp = ui
-                        .add_enabled(!running_profile, btn)
+                        .add_enabled(!running_profile && !busy, btn)
                         .on_hover_text(format!("Launch with “{current_profile_name}”"));
                     if resp.clicked() {
                         actions.push(Action::Play);
@@ -812,13 +798,21 @@ impl App {
             ui.add_space(4.0);
             let game = &self.library.games[g];
             for (i, p) in game.profiles.iter().enumerate() {
-                let star = if Some(i) == default_idx { "★ " } else { "" };
-                let dot = if self.is_running(&game.name, Some(&p.name)) { "  ●" } else { "" };
                 let selected = i == self.profile;
-                let text = RichText::new(format!("{star}{}{dot}", ellipsize(&p.name, 28)))
-                    .color(if selected { Color32::WHITE } else { TEXT });
+                let color = if selected { Color32::WHITE } else { TEXT };
+                let mut chip = LayoutJob::default();
+                if Some(i) == default_idx {
+                    let star = if selected { Color32::WHITE } else { AMBER };
+                    icons::part(&mut chip, icons::STAR_FILL.as_str(), icons::font(13.0), star, 0.0);
+                }
+                let gap = if chip.sections.is_empty() { 0.0 } else { 7.0 };
+                icons::part(&mut chip, &ellipsize(&p.name, 28), FontId::proportional(15.0), color, gap);
+                if self.is_running(&game.name, Some(&p.name)) {
+                    let dot = if selected { Color32::WHITE } else { GREEN };
+                    icons::part(&mut chip, icons::DOT.as_str(), icons::font(10.0), dot, 7.0);
+                }
                 let resp = ui.add(
-                    Button::new(text)
+                    Button::new(chip)
                         .fill(if selected { ACCENT } else { CARD })
                         .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }))
                         .corner_radius(CornerRadius::same(17))
@@ -831,8 +825,9 @@ impl App {
                     actions.push(Action::Play);
                 }
             }
+            let new_chip = icons::ADD.with_text(13.0, "New", FontId::proportional(15.0), MUTED);
             if ui
-                .add(Button::new(RichText::new("＋ New").color(MUTED)).corner_radius(CornerRadius::same(17)).min_size(vec2(0.0, 34.0)))
+                .add(Button::new(new_chip).corner_radius(CornerRadius::same(17)).min_size(vec2(0.0, 34.0)))
                 .clicked()
             {
                 actions.push(Action::NewProfile);
@@ -858,23 +853,23 @@ impl App {
 
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| section_title(ui, "Launch", "What to start and how"));
+                    ui.vertical(|ui| section_title(ui, "Launch", "Which repo starts this game, and from where"));
                     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                         if can_delete {
                             if confirm_profile {
                                 if ui.add(Button::new(RichText::new("Really delete?").color(Color32::WHITE)).fill(RED)).clicked() {
                                     actions.push(Action::DeleteProfile);
                                 }
-                            } else if ui.add(ghost_button("Delete", RED)).clicked() {
+                            } else if ui.add(ghost_button(icons::DELETE, "Delete", RED)).clicked() {
                                 set_confirm_profile = Some(true);
                             }
                         }
-                        if ui.add(ghost_button("Duplicate", MUTED)).clicked() {
+                        if ui.add(ghost_button(icons::DUPLICATE, "Duplicate", MUTED)).clicked() {
                             actions.push(Action::DuplicateProfile);
                         }
                         if is_default {
-                            ui.label(RichText::new("★ Default").color(AMBER));
-                        } else if ui.add(ghost_button("☆ Make default", MUTED)).clicked() {
+                            ui.label(icons::STAR_FILL.with_text(14.0, "Default", FontId::proportional(15.0), AMBER));
+                        } else if ui.add(ghost_button(icons::STAR, "Make default", MUTED)).clicked() {
                             actions.push(Action::MakeDefault);
                         }
                     });
@@ -886,150 +881,99 @@ impl App {
                 if names.iter().enumerate().any(|(i, n)| i != self.profile && *n == p.name) {
                     ui.label(RichText::new("Another profile already has this name").color(AMBER).small());
                 }
-                field_label(ui, "HOW TO START IT");
-                ui.horizontal(|ui| {
-                    let (w, _) = card_width(ui, 2);
-                    let w = w.max(200.0).min((ui.available_width() - 8.0) / 2.0);
-                    for (kind, title, sub) in [
-                        (LaunchKind::Program, "Program or URL", "Run a game .exe, mod loader, emulator, or a Steam/Epic link"),
-                        (LaunchKind::Repo, "Repo method", "Pick your game folder and a repo from the list, then follow its instructions"),
-                    ] {
-                        if option_card(ui, p.kind == kind, title, sub, vec2(w, 80.0)).clicked() && p.kind != kind {
-                            p.kind = kind;
-                            changed = true;
-                        }
-                    }
-                });
+                field_label(ui, "GAME FOLDER");
+                changed |= folder_field(ui, &mut p.game_dir, r"C:\Games\MyGame");
 
-                match p.kind {
-                    LaunchKind::Program => {
-                        field_label(ui, "PROGRAM OR URL");
-                        changed |= path_field(ui, &mut p.executable, r"C:\Games\MyGame\game.exe  or  steam://rungameid/…", Browse::File);
-                        field_label(ui, "ARGUMENTS");
-                        changed |= text_field(ui, &mut p.arguments, r#"-windowed -config "{exe_dir}\mods.ini""#, full).changed();
-                        field_label(ui, "WORKING FOLDER");
-                        changed |= path_field(ui, &mut p.working_dir, "Leave empty to use the program's folder", Browse::Folder);
-                        ui.label(
-                            RichText::new("Placeholders {exe_dir} and {profile}, and variables like %APPDATA%, work in every field.")
-                                .color(MUTED)
-                                .small(),
-                        );
-                    }
-                    LaunchKind::Repo => {
-                        field_label(ui, "GAME FOLDER");
-                        changed |= path_field(ui, &mut p.game_dir, r"C:\Games\MyGame", Browse::Folder);
-
-                        field_label(ui, "CHOOSE A REPO");
-                        if !p.repo_id.is_empty() && !self.repos.iter().any(|r| r.id == p.repo_id) {
-                            ui.label(
-                                RichText::new(format!("This profile used '{}', which is no longer in the list. Pick another.", p.repo_id))
-                                    .color(AMBER)
-                                    .small(),
-                            );
-                        }
-                        let (w, cols) = card_width(ui, self.repos.len());
-                        for row in self.repos.chunks(cols) {
-                            ui.horizontal(|ui| {
-                                for r in row {
-                                    let sub = r.method.describe();
-                                    if option_card(ui, p.repo_id == r.id, &r.name, &sub, vec2(w, 82.0)).clicked()
-                                        && p.repo_id != r.id
-                                    {
-                                        p.repo_id = r.id.clone();
-                                        changed = true;
-                                    }
-                                }
-                            });
-                        }
-
-                        if let Some(repo) = self.repos.iter().find(|r| r.id == p.repo_id) {
-                            field_label(ui, "REPO FOLDER (WHERE YOU DOWNLOADED IT)");
-                            changed |= path_field(ui, &mut p.repo_dir, r"C:\Tools\repo-name", Browse::Folder);
-
-                            ui.add_space(6.0);
-                            Frame::new()
-                                .fill(FIELD)
-                                .stroke(Stroke::new(1.0, BORDER))
-                                .corner_radius(CornerRadius::same(10))
-                                .inner_margin(Margin::same(14))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new(&repo.name).strong().size(16.0));
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            if !repo.url.is_empty() {
-                                                ui.hyperlink_to("Open on GitHub ↗", &repo.url);
-                                            }
-                                        });
-                                    });
-                                    ui.label(RichText::new(repo.method.describe()).color(ACCENT_HOVER).small());
-                                    ui.add_space(6.0);
-                                    ui.label(RichText::new("INSTRUCTIONS").color(MUTED).small().strong());
-                                    if repo.instructions.trim().is_empty() {
-                                        ui.label(RichText::new("No instructions for this repo yet.").color(MUTED));
-                                    } else {
-                                        ui.label(&repo.instructions);
-                                    }
-                                });
-                        } else if self.repos.is_empty() {
-                            ui.label(RichText::new("The repo list is empty. Add repos to repos.json.").color(AMBER).small());
-                        }
-                    }
+                field_label(ui, "REPO");
+                if !p.repo_id.is_empty() && !self.repos.iter().any(|r| r.id == p.repo_id) {
+                    ui.label(
+                        RichText::new(format!("This profile used '{}', which is no longer in the list. Pick another.", p.repo_id))
+                            .color(AMBER)
+                            .small(),
+                    );
                 }
-            });
-
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                section_title(ui, "Environment variables", "Set only for this profile");
-                let mut remove = None;
-                for (i, var) in p.env.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        let w = (ui.available_width() - 50.0) / 2.0;
-                        changed |= text_field(ui, &mut var.key, "NAME", w * 0.8).changed();
-                        ui.label(RichText::new("=").color(MUTED));
-                        changed |= text_field(ui, &mut var.value, "value", w * 1.2 - 16.0).changed();
-                        if ui.add(ghost_button("✕", MUTED)).on_hover_text("Remove").clicked() {
-                            remove = Some(i);
+                let selected = match self.repos.iter().find(|r| r.id == p.repo_id) {
+                    Some(r) => RichText::new(&r.name).color(TEXT),
+                    None => RichText::new("Choose a repo…").color(MUTED),
+                };
+                egui::ComboBox::from_id_salt("repo")
+                    .selected_text(selected)
+                    .width(full - 24.0)
+                    .height(360.0)
+                    .show_ui(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for r in &self.repos {
+                            let picked = p.repo_id == r.id;
+                            let mut entry = LayoutJob::default();
+                            let name_color = if picked { Color32::WHITE } else { TEXT };
+                            icons::part(&mut entry, &r.name, FontId::proportional(15.0), name_color, 0.0);
+                            let about = r.summary();
+                            if !about.trim().is_empty() {
+                                // muted grey would disappear into the accent fill
+                                let about_color = if picked { Color32::from_rgb(214, 205, 255) } else { MUTED };
+                                icons::part(&mut entry, &about, FontId::proportional(12.5), about_color, 10.0);
+                            }
+                            if ui.selectable_label(picked, entry).clicked() && !picked {
+                                p.repo_id = r.id.clone();
+                                changed = true;
+                            }
                         }
                     });
-                }
-                if let Some(i) = remove {
-                    p.env.remove(i);
-                    changed = true;
-                }
-                if ui.button("＋ Add variable").clicked() {
-                    p.env.push(EnvVar::default());
-                    changed = true;
-                }
-            });
 
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                section_title(
-                    ui,
-                    "Mods",
-                    "Copy a folder of mod files into the game before it starts. Originals are backed up.",
-                );
-                field_label(ui, "MOD FOLDER");
-                changed |= path_field(ui, &mut p.mod_source, "Leave empty for no mods", Browse::Folder);
-                field_label(ui, "COPY MODS INTO");
-                changed |= path_field(ui, &mut p.mod_target, "Leave empty to use the working folder", Browse::Folder);
-                ui.add_space(4.0);
-                changed |= ui.checkbox(&mut p.restore_mods, "Put the original files back when the game closes").changed();
-            });
+                if let Some(repo) = self.repos.iter().find(|r| r.id == p.repo_id) {
+                    // what the launcher has downloaded for this repo, and a
+                    // way to fetch it again
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let state = match fetch::stamp(repo) {
+                            Some(s) if fetch::is_ready(repo) => {
+                                RichText::new(format!("{} · downloaded {}", s.version, s.when())).color(MUTED)
+                            }
+                            _ => RichText::new("Not downloaded yet — Play will fetch it").color(AMBER),
+                        };
+                        ui.label(state.small());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(!busy, ghost_button(icons::REFRESH, "Update", ACCENT_HOVER))
+                                .on_hover_text("Download this repo again, newest version")
+                                .clicked()
+                            {
+                                actions.push(Action::UpdateRepo(repo.id.clone()));
+                            }
+                        });
+                    });
 
-            ui.add_space(12.0);
-            card(ui, |ui| {
-                section_title(ui, "Notes", "");
-                changed |= ui
-                    .add(
-                        TextEdit::multiline(&mut p.notes)
-                            .hint_text("Anything worth remembering about this setup")
-                            .margin(Margin::symmetric(10, 8))
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed();
+                    ui.add_space(6.0);
+                    Frame::new()
+                        .fill(FIELD)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&repo.name).strong().size(16.0));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if !repo.url.is_empty() {
+                                        ui.hyperlink_to(
+                                            icons::OPEN_IN_NEW.with_text(13.0, "Open on GitHub", FontId::proportional(15.0), ACCENT_HOVER),
+                                            &repo.url,
+                                        );
+                                    }
+                                });
+                            });
+                            ui.label(RichText::new(repo.method.describe()).color(ACCENT_HOVER).small());
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("INSTRUCTIONS").color(MUTED).small().strong());
+                            if repo.instructions.trim().is_empty() {
+                                ui.label(RichText::new("No instructions for this repo yet.").color(MUTED));
+                            } else {
+                                ui.label(&repo.instructions);
+                            }
+                        });
+                } else if self.repos.is_empty() {
+                    ui.label(RichText::new("The repo list is empty. Add repos to repos.json.").color(AMBER).small());
+                }
             });
 
             // keep the default pointing at this profile if it was renamed
@@ -1047,7 +991,7 @@ impl App {
                     if ui.button("Cancel").clicked() {
                         set_confirm_game = Some(false);
                     }
-                } else if ui.add(ghost_button("Remove this game…", RED)).clicked() {
+                } else if ui.add(ghost_button(icons::DELETE, "Remove this game…", RED)).clicked() {
                     set_confirm_game = Some(true);
                 }
             });
@@ -1079,7 +1023,8 @@ impl App {
                 let text = if self.dirty_since.is_some() { "Saving…" } else { "All changes saved" };
                 ui.label(RichText::new(text).color(MUTED).small());
                 if !self.running.is_empty() {
-                    ui.label(RichText::new(format!("● {} running", self.running.len())).color(GREEN).small());
+                    let text = format!("{} running", self.running.len());
+                    ui.label(icons::DOT.with_text(9.0, &text, FontId::proportional(12.5), GREEN));
                 }
             });
         });
@@ -1109,10 +1054,7 @@ impl eframe::App for App {
         egui::CentralPanel::no_frame()
             .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(28, 22)))
             .show(ui, |ui| match self.game {
-                Some(g) if !self.show_library => {
-                    self.pending_banner(ui, &mut actions);
-                    self.game_view(ui, g, &mut actions)
-                }
+                Some(g) if !self.show_library => self.game_view(ui, g, &mut actions),
                 _ => self.library_view(ui, &mut actions),
             });
 

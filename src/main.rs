@@ -1,9 +1,10 @@
 // No console window when started from Explorer in release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod fetch;
+mod icons;
 mod launch;
 mod model;
-mod mods;
 mod repos;
 mod storage;
 mod ui;
@@ -17,7 +18,7 @@ Usage:
   gamelauncher                          open the window
   gamelauncher list                     list games and profiles
   gamelauncher run <game> [profile]     launch (default profile if none given)
-  gamelauncher restore-mods             put back files replaced by mods";
+  gamelauncher update [repo-id]         re-download repos (all of them if none given)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,6 +38,15 @@ fn main() -> ExitCode {
 fn fail(msg: String) -> ExitCode {
     eprintln!("{msg}");
     ExitCode::FAILURE
+}
+
+/// Download whatever the profile's repo needs, if it is not here yet.
+fn fetch_for(profile: &model::Profile, repos: &[repos::Repo]) -> anyhow::Result<()> {
+    let Some(repo) = repos.iter().find(|r| r.id == profile.repo_id) else {
+        anyhow::bail!("'{}' has no repo set. Open the launcher and pick one.", profile.name);
+    };
+    fetch::ensure(repo, false, &|line| println!("{line}"))?;
+    Ok(())
 }
 
 fn cli(args: &[String]) -> anyhow::Result<ExitCode> {
@@ -63,24 +73,31 @@ fn cli(args: &[String]) -> anyhow::Result<ExitCode> {
                 Some(p) => game.profile(p).ok_or_else(|| anyhow::anyhow!("{} has no profile named '{p}'", game.name))?,
                 None => game.default().ok_or_else(|| anyhow::anyhow!("{} has no profiles", game.name))?,
             };
+            let repos = repos::load().0;
+            fetch_for(profile, &repos)?;
             let (tx, rx) = std::sync::mpsc::channel();
-            launch::launch(profile, &repos::load().0, true, move |info| {
-                let _ = tx.send(info);
+            launch::launch(profile, &repos, true, move |code| {
+                let _ = tx.send(code);
             })?;
-            let info = rx.recv()?;
-            if let Some(err) = info.restore_error {
-                eprintln!("Mod files could not be restored: {err}. Run `gamelauncher restore-mods`.");
-            }
-            Ok(ExitCode::from(info.code.unwrap_or(0).clamp(0, 255) as u8))
+            Ok(ExitCode::from(rx.recv()?.unwrap_or(0).clamp(0, 255) as u8))
         }
-        "restore-mods" => {
-            let pending = mods::pending_restores(&launch::backups_root());
-            if pending.is_empty() {
-                println!("Nothing to restore.");
+        "update" => {
+            let repos = repos::load().0;
+            let wanted = args.get(1);
+            let picked: Vec<&repos::Repo> =
+                repos.iter().filter(|r| wanted.is_none_or(|w| r.id == *w)).collect();
+            if picked.is_empty() {
+                anyhow::bail!("No repo with id '{}'", wanted.map(String::as_str).unwrap_or(""));
             }
-            for o in pending {
-                mods::restore_overlay(&o)?;
-                println!("Restored {}", o.target.display());
+            // entries that share a url share a clone, so fetch it once
+            let mut done = std::collections::HashSet::new();
+            for repo in picked {
+                if !done.insert(repo.url.trim()) {
+                    println!("{} shares that clone", repo.name);
+                    continue;
+                }
+                fetch::ensure(repo, true, &|line| println!("{line}"))?;
+                println!("{} is up to date", repo.name);
             }
             Ok(ExitCode::SUCCESS)
         }

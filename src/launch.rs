@@ -1,24 +1,14 @@
 //! Turn a profile into a running process.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
-use crate::model::{EnvVar, LaunchKind, Profile};
-use crate::repos::{Method, Repo};
-use crate::{mods, storage};
-
-pub fn is_url(executable: &str) -> bool {
-    let s = executable.trim();
-    let Some(idx) = s.find("://") else { return false };
-    let scheme = &s[..idx];
-    // Exclude things like "C://", which is a (strange) Windows path.
-    scheme.len() > 1
-        && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
-}
+use crate::fetch;
+use crate::model::Profile;
+use crate::repos::{self, Method, Repo};
 
 /// Split an argument string the way a Windows user would type it: spaces
 /// separate, double quotes group, backslashes are kept as they are.
@@ -101,48 +91,6 @@ pub fn expand_env(s: &str, env: &HashMap<String, String>) -> String {
     out
 }
 
-#[derive(Debug, PartialEq)]
-pub enum Plan {
-    Url(String),
-    Process { program: PathBuf, args: Vec<String>, cwd: PathBuf, env: HashMap<String, String> },
-}
-
-pub fn plan(profile: &Profile) -> Result<Plan> {
-    let exe = profile.executable.trim();
-    if exe.is_empty() {
-        bail!("'{}' has no program or URL set", profile.name);
-    }
-    if is_url(exe) {
-        return Ok(Plan::Url(exe.to_string()));
-    }
-
-    let mut env: HashMap<String, String> = std::env::vars().collect();
-    let program = PathBuf::from(expand_env(exe, &env));
-    let exe_dir = program.parent().map(Path::to_path_buf).unwrap_or_default();
-    let exe_dir_s = exe_dir.to_string_lossy().to_string();
-
-    let fill = |s: &str, env: &HashMap<String, String>| {
-        let s = s
-            .replace("{exe_dir}", &exe_dir_s)
-            .replace("{profile}", &profile.name)
-            .replace("{game_dir}", profile.game_dir.trim())
-            .replace("{repo_dir}", profile.repo_dir.trim());
-        expand_env(&s, env)
-    };
-
-    let base_env = env.clone();
-    for var in profile.env.iter().filter(|v| !v.key.trim().is_empty()) {
-        env.insert(var.key.trim().to_string(), fill(&var.value, &base_env));
-    }
-    let cwd = if profile.working_dir.trim().is_empty() {
-        exe_dir
-    } else {
-        PathBuf::from(fill(profile.working_dir.trim(), &env))
-    };
-    let args = split_args(&profile.arguments).iter().map(|a| fill(a, &env)).collect();
-    Ok(Plan::Process { program, args, cwd, env })
-}
-
 /// A file to copy into the game folder before launch.
 #[derive(Debug, PartialEq)]
 pub struct Copy {
@@ -150,157 +98,161 @@ pub struct Copy {
     pub to: PathBuf,
 }
 
-fn quote(s: &str) -> String {
-    format!("\"{s}\"")
+/// Everything needed to start a profile, worked out from its repo's method.
+#[derive(Debug, PartialEq)]
+pub struct Plan {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: HashMap<String, String>,
+    /// Files to copy into the game folder before starting.
+    pub copies: Vec<Copy>,
 }
 
-/// For repo profiles: work out what to run from the repo's method. Returns a
-/// profile that runs it directly, plus any files to copy first. Program
-/// profiles come back unchanged.
-pub fn resolve(profile: &Profile, repos: &[Repo]) -> Result<(Profile, Vec<Copy>)> {
-    if profile.kind != LaunchKind::Repo {
-        return Ok((profile.clone(), vec![]));
-    }
+/// Work out what to run for `profile` from its repo's method.
+///
+/// The repo's files are wherever [`fetch`] put them, so this expects
+/// [`fetch::ensure`] to have run. The program gets `GAME_DIR` and `REPO_DIR`,
+/// and `{game_dir}`, `{repo_dir}`, `{profile}` and variables like `%APPDATA%`
+/// are filled in wherever the method uses them.
+pub fn plan(profile: &Profile, repos: &[Repo]) -> Result<Plan> {
     let repo = repos
         .iter()
         .find(|r| r.id == profile.repo_id)
         .ok_or_else(|| anyhow::anyhow!("Pick a repo for '{}'", profile.name))?;
-    let game_dir = PathBuf::from(profile.game_dir.trim());
-    if profile.game_dir.trim().is_empty() || !game_dir.is_dir() {
+
+    let game_dir_s = profile.game_dir.trim();
+    let game_dir = PathBuf::from(game_dir_s);
+    if game_dir_s.is_empty() || !game_dir.is_dir() {
         bail!("Pick the game folder for '{}'", profile.name);
     }
-    let repo_dir = PathBuf::from(profile.repo_dir.trim());
-    let has_repo_dir = !profile.repo_dir.trim().is_empty();
-    if has_repo_dir && !repo_dir.is_dir() {
-        bail!("Repo folder not found: {}", repo_dir.display());
-    }
-    let fill_dirs = |s: &str| {
-        s.replace("{game_dir}", profile.game_dir.trim()).replace("{repo_dir}", profile.repo_dir.trim())
+    let repo_dir = fetch::repo_dir(&repo.url);
+    let repo_dir_s = repo_dir.to_string_lossy().into_owned();
+
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    env.insert("GAME_DIR".into(), game_dir_s.to_string());
+    env.insert("REPO_DIR".into(), repo_dir_s.clone());
+
+    let fill = |s: &str| {
+        let s = s
+            .replace("{game_dir}", game_dir_s)
+            .replace("{repo_dir}", &repo_dir_s)
+            .replace("{profile}", &profile.name);
+        expand_env(&s, &env)
     };
+    let fill_args = |s: &str| split_args(s).iter().map(|a| fill(a)).collect::<Vec<_>>();
 
-    let mut out = profile.clone();
-    out.env.push(EnvVar { key: "GAME_DIR".into(), value: profile.game_dir.trim().into() });
-    out.env.push(EnvVar { key: "REPO_DIR".into(), value: profile.repo_dir.trim().into() });
-    let mut copies = vec![];
-
-    match &repo.method {
+    let (program, args, cwd, copies) = match &repo.method {
         Method::Bat { file, args } => {
-            let file = PathBuf::from(fill_dirs(file));
-            let bat = if file.is_absolute() {
-                file
-            } else if has_repo_dir {
-                repo_dir.join(file)
+            let named = fill(file);
+            let path = PathBuf::from(&named);
+            let bat = if path.is_absolute() {
+                path
             } else {
-                bail!("Pick the folder you downloaded {} to", repo.name);
+                repos::script(&named).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} runs '{named}', which is not in a scripts folder. Put it in {}",
+                        repo.name,
+                        repos::script_dirs()[0].display()
+                    )
+                })?
             };
             if !bat.is_file() {
                 bail!("{} not found", bat.display());
             }
-            let bat_s = bat.to_string_lossy().into_owned();
+            // The script works on the clone, so start it there.
             if cfg!(windows) {
-                out.executable = bat_s;
-                out.arguments = args.clone();
+                (bat, fill_args(args), repo_dir.clone(), vec![])
             } else {
-                out.executable = "sh".into();
-                out.arguments = format!("{} {args}", quote(&bat_s));
+                let mut sh_args = vec![bat.to_string_lossy().into_owned()];
+                sh_args.extend(fill_args(args));
+                (PathBuf::from("sh"), sh_args, repo_dir.clone(), vec![])
             }
-            out.working_dir = bat.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         }
-        Method::CopyAndRun { copy, run, args } => {
-            if !has_repo_dir {
-                bail!("Pick the folder you downloaded {} to", repo.name);
-            }
-            for rel in copy {
-                let from = repo_dir.join(fill_dirs(rel));
+        Method::CopyAndRun { assets, run, args } => {
+            let mut copies = vec![];
+            for name in assets {
+                let from = repo_dir.join(name);
                 if !from.is_file() {
-                    bail!("{} not found in the repo folder", rel);
+                    bail!("{} has not been downloaded yet. Press Update for {}.", name, repo.name);
                 }
-                let name = from.file_name().unwrap_or_default();
                 copies.push(Copy { to: game_dir.join(name), from });
             }
-            out.executable = game_dir.join(fill_dirs(run)).to_string_lossy().into_owned();
-            out.arguments = args.clone();
-            out.working_dir = profile.game_dir.trim().into();
+            let program = game_dir.join(fill(run));
+            (program, fill_args(args), game_dir.clone(), copies)
         }
-    }
-    out.kind = LaunchKind::Program;
-    Ok((out, copies))
+    };
+
+    Ok(Plan { program, args, cwd, env, copies })
 }
 
-/// Copy files into the game folder. A file that is already there is backed
-/// up once as `<name>.launcher-backup` before it is replaced.
-pub fn do_copies(copies: &[Copy]) -> Result<()> {
+/// A file the launcher put in the game folder, and what to do about it when
+/// the game closes.
+#[derive(Debug, PartialEq)]
+pub struct Restore {
+    /// The file that was copied in.
+    pub path: PathBuf,
+    /// What stood there before, set aside as `<name>.launcher-backup`.
+    pub backup: Option<PathBuf>,
+}
+
+/// Copy files into the game folder, setting aside anything already there.
+///
+/// Returns what to hand to [`undo_copies`] once the game has closed. An
+/// existing `.launcher-backup` is left alone: that one is the real original,
+/// from a run whose clean-up never happened.
+pub fn do_copies(copies: &[Copy]) -> Result<Vec<Restore>> {
+    let mut restores = vec![];
     for c in copies {
+        let mut backup = None;
         if c.to.exists() {
-            let mut backup = c.to.clone().into_os_string();
-            backup.push(".launcher-backup");
-            let backup = PathBuf::from(backup);
-            if !backup.exists() && std::fs::read(&c.to).ok() != std::fs::read(&c.from).ok() {
-                std::fs::copy(&c.to, &backup)?;
+            let mut name = c.to.clone().into_os_string();
+            name.push(".launcher-backup");
+            let saved = PathBuf::from(name);
+            if !saved.exists() {
+                std::fs::rename(&c.to, &saved)
+                    .with_context(|| format!("setting aside {}", c.to.display()))?;
             }
+            backup = Some(saved);
         }
         std::fs::copy(&c.from, &c.to)
             .map_err(|e| anyhow::anyhow!("Could not copy {} into the game folder: {e}", c.from.display()))?;
+        restores.push(Restore { path: c.to.clone(), backup });
     }
-    Ok(())
+    Ok(restores)
 }
 
-pub fn backups_root() -> PathBuf {
-    storage::data_dir().join("mod-backups")
-}
-
-/// What happened when a launched game finished.
-#[derive(Debug, Clone)]
-pub struct ExitInfo {
-    /// `None` for launcher URLs, which give us no process to wait on.
-    pub code: Option<i32>,
-    pub restore_error: Option<String>,
-}
-
-/// Start the profile, applying its mod overlay first if it has one.
+/// Put the game folder back as it was: take out what was copied in, and
+/// return anything that was set aside.
 ///
-/// When the game exits, the overlay is undone (if `restore_mods` is set) and
-/// `on_exit` is called. With `wait` this blocks until then, otherwise a
-/// background thread waits.
+/// Best effort, and deliberately quiet: a file the game still holds open is
+/// left where it is, and the next launch copies over it anyway.
+pub fn undo_copies(restores: &[Restore]) {
+    for r in restores.iter().rev() {
+        let _ = std::fs::remove_file(&r.path);
+        if let Some(saved) = &r.backup {
+            let _ = std::fs::rename(saved, &r.path);
+        }
+    }
+}
+
+/// Start the profile. When the game exits, anything copied into the game
+/// folder is taken out again and `on_exit` is called with its exit code
+/// (`None` if it was stopped by a signal). With `wait` this blocks until
+/// then, otherwise a background thread waits.
 pub fn launch(
     profile: &Profile,
     repos: &[Repo],
     wait: bool,
-    on_exit: impl FnOnce(ExitInfo) + Send + 'static,
+    on_exit: impl FnOnce(Option<i32>) + Send + 'static,
 ) -> Result<()> {
-    let (resolved, copies) = resolve(profile, repos)?;
-    let profile = &resolved;
-    let plan = plan(profile)?;
-    do_copies(&copies)?;
+    let plan = plan(profile, repos)?;
+    let restores = do_copies(&plan.copies)?;
 
-    let overlay = if profile.mod_source.trim().is_empty() {
-        None
-    } else {
-        let target = if !profile.mod_target.trim().is_empty() {
-            PathBuf::from(profile.mod_target.trim())
-        } else if let Plan::Process { cwd, .. } = &plan {
-            cwd.clone()
-        } else {
-            bail!("Set 'Copy mods into' for profiles that start from a URL");
-        };
-        Some(mods::apply_overlay(Path::new(profile.mod_source.trim()), &target, &backups_root())?)
-    };
-
-    let (program, args, cwd, env) = match plan {
-        Plan::Url(url) => {
-            // Steam/Epic take over from here, so there is nothing to wait on
-            // and mod files stay in place until restored by hand.
-            open::that_detached(&url)?;
-            on_exit(ExitInfo { code: None, restore_error: None });
-            return Ok(());
-        }
-        Plan::Process { program, args, cwd, env } => (program, args, cwd, env),
-    };
-
-    let mut cmd = Command::new(&program);
-    cmd.args(&args).env_clear().envs(&env);
-    if !cwd.as_os_str().is_empty() {
-        cmd.current_dir(&cwd);
+    let mut cmd = Command::new(&plan.program);
+    cmd.args(&plan.args).env_clear().envs(&plan.env);
+    if !plan.cwd.as_os_str().is_empty() {
+        cmd.current_dir(&plan.cwd);
     }
     #[cfg(windows)]
     {
@@ -310,23 +262,18 @@ pub fn launch(
     }
 
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(child) => child,
         Err(e) => {
-            if let Some(o) = &overlay {
-                let _ = mods::restore_overlay(o);
-            }
-            bail!("Could not start {}: {e}", program.display());
+            // nothing is going to run, so don't leave our files behind
+            undo_copies(&restores);
+            bail!("Could not start {}: {e}", plan.program.display());
         }
     };
 
-    let restore = profile.restore_mods;
     let watch = move || {
         let code = child.wait().ok().and_then(|s| s.code());
-        let restore_error = match (&overlay, restore) {
-            (Some(o), true) => mods::restore_overlay(o).err().map(|e| e.to_string()),
-            _ => None,
-        };
-        on_exit(ExitInfo { code, restore_error });
+        undo_copies(&restores);
+        on_exit(code);
     };
     if wait {
         watch();
@@ -339,7 +286,17 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::EnvVar;
+
+    fn repo(id: &str, method: Method) -> Repo {
+        Repo {
+            id: id.into(),
+            name: id.to_uppercase(),
+            url: format!("https://github.com/test/{id}"),
+            description: String::new(),
+            instructions: String::new(),
+            method,
+        }
+    }
 
     #[test]
     fn splits_like_windows() {
@@ -352,112 +309,129 @@ mod tests {
     }
 
     #[test]
-    fn detects_urls() {
-        assert!(is_url("steam://rungameid/489830"));
-        assert!(is_url("com.epicgames.launcher://apps/x?action=launch"));
-        assert!(!is_url(r"C:\Games\game.exe"));
-        assert!(!is_url("C://Games/game.exe"));
-    }
-
-    #[test]
     fn expands_env_styles() {
         let env: HashMap<String, String> =
             [("APPDATA".into(), "/ad".into()), ("X".into(), "1".into())].into();
         assert_eq!(expand_env("%appdata%/a $X ${X}b %NOPE% 100%", &env), "/ad/a 1 1b %NOPE% 100%");
     }
 
+    /// The game folder is left exactly as it was found.
     #[test]
-    fn plan_fills_placeholders() {
-        let p = Profile {
-            executable: "/games/g/bin/game".into(),
-            arguments: r#"-cfg "{exe_dir}/cfg.ini" -p {profile}"#.into(),
-            env: vec![EnvVar { key: "DIR".into(), value: "{exe_dir}".into() }],
-            ..Profile::named("Mods")
-        };
-        let Plan::Process { program, args, cwd, env } = plan(&p).unwrap() else { panic!() };
-        assert_eq!(program, PathBuf::from("/games/g/bin/game"));
-        assert_eq!(args, vec!["-cfg", "/games/g/bin/cfg.ini", "-p", "Mods"]);
-        assert_eq!(cwd, PathBuf::from("/games/g/bin"));
-        assert_eq!(env["DIR"], "/games/g/bin");
-    }
-
-    #[test]
-    fn plan_needs_a_program() {
-        assert!(plan(&Profile::default()).is_err());
-        assert_eq!(
-            plan(&Profile { executable: "steam://rungameid/1".into(), ..Default::default() }).unwrap(),
-            Plan::Url("steam://rungameid/1".into())
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn runs_process_with_mods_then_restores() {
+    fn copies_in_then_puts_the_game_folder_back() {
         let dir = tempfile::tempdir().unwrap();
-        let (game, m) = (dir.path().join("game"), dir.path().join("mod"));
+        let (have, game) = (dir.path().join("have"), dir.path().join("game"));
+        std::fs::create_dir_all(&have).unwrap();
         std::fs::create_dir_all(&game).unwrap();
-        std::fs::create_dir_all(&m).unwrap();
-        std::fs::write(game.join("a.txt"), "orig").unwrap();
-        std::fs::write(m.join("a.txt"), "mod").unwrap();
-        // SAFETY: tests touching GAMELAUNCHER_HOME only run here.
-        unsafe { std::env::set_var("GAMELAUNCHER_HOME", dir.path().join("home")) };
+        std::fs::write(have.join("victory.exe"), "downloaded").unwrap();
+        let copies = vec![Copy { from: have.join("victory.exe"), to: game.join("victory.exe") }];
 
-        let p = Profile {
-            executable: "/bin/sh".into(),
-            arguments: r#"-c "echo $(cat a.txt)-$MODE-$0 > seen.txt" hi"#.into(),
-            working_dir: game.to_string_lossy().into(),
-            env: vec![EnvVar { key: "MODE".into(), value: "modded".into() }],
-            mod_source: m.to_string_lossy().into(),
-            ..Profile::named("Test")
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        launch(&p, &[], true, move |info| tx.send(info).unwrap()).unwrap();
-        let info = rx.recv().unwrap();
-        assert_eq!(info.code, Some(0));
-        assert!(info.restore_error.is_none());
-        assert_eq!(std::fs::read_to_string(game.join("seen.txt")).unwrap().trim(), "mod-modded-hi");
-        assert_eq!(std::fs::read_to_string(game.join("a.txt")).unwrap(), "orig");
+        // nothing there before: the file arrives, then leaves no trace
+        let restores = do_copies(&copies).unwrap();
+        assert_eq!(std::fs::read_to_string(game.join("victory.exe")).unwrap(), "downloaded");
+        undo_copies(&restores);
+        assert!(std::fs::read_dir(&game).unwrap().next().is_none());
+
+        // a file of the same name was there: it comes back, byte for byte
+        std::fs::write(game.join("victory.exe"), "yours").unwrap();
+        let restores = do_copies(&copies).unwrap();
+        assert_eq!(std::fs::read_to_string(game.join("victory.exe")).unwrap(), "downloaded");
+        undo_copies(&restores);
+        assert_eq!(std::fs::read_to_string(game.join("victory.exe")).unwrap(), "yours");
+        assert_eq!(std::fs::read_dir(&game).unwrap().count(), 1);
     }
 
+    /// A run whose clean-up never happened leaves a backup behind. The next
+    /// run must not overwrite it with the copy we left there.
+    #[test]
+    fn an_older_backup_is_the_real_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (have, game) = (dir.path().join("have"), dir.path().join("game"));
+        std::fs::create_dir_all(&have).unwrap();
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(have.join("victory.exe"), "downloaded").unwrap();
+        std::fs::write(game.join("victory.exe"), "left behind").unwrap();
+        std::fs::write(game.join("victory.exe.launcher-backup"), "yours").unwrap();
+
+        let copies = vec![Copy { from: have.join("victory.exe"), to: game.join("victory.exe") }];
+        let restores = do_copies(&copies).unwrap();
+        undo_copies(&restores);
+        assert_eq!(std::fs::read_to_string(game.join("victory.exe")).unwrap(), "yours");
+        assert_eq!(std::fs::read_dir(&game).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn plan_needs_a_repo_a_game_folder_and_its_files() {
+        assert!(plan(&Profile::default(), &[]).is_err());
+        let repos = vec![repo("b", Method::Bat { file: "nothing-here.bat".into(), args: String::new() })];
+        // the right repo, but no game folder yet
+        let p = Profile { repo_id: "b".into(), ..Profile::named("R") };
+        assert!(plan(&p, &repos).is_err());
+        // a game folder, but the script it names is in no scripts folder
+        let dir = tempfile::tempdir().unwrap();
+        let p = Profile { game_dir: dir.path().to_string_lossy().into(), ..p };
+        assert!(plan(&p, &repos).is_err());
+    }
+
+    /// Both methods, with the files where [`fetch`] would have put them.
     #[cfg(unix)]
     #[test]
     fn repo_methods() {
-        use crate::repos::{Method, Repo};
         let dir = tempfile::tempdir().unwrap();
-        let (game, repo) = (dir.path().join("game"), dir.path().join("repo"));
-        std::fs::create_dir_all(repo.join("bin")).unwrap();
+        let home = dir.path().join("home");
+        // SAFETY: tests touching GAMELAUNCHER_HOME only run here.
+        unsafe { std::env::set_var("GAMELAUNCHER_HOME", &home) };
+
+        let game = dir.path().join("game");
         std::fs::create_dir_all(&game).unwrap();
-        std::fs::write(repo.join("start.bat"), "echo \"$GAME_DIR|$1\" > \"$GAME_DIR/bat.txt\"").unwrap();
-        std::fs::write(repo.join("bin/run.sh"), "new").unwrap();
         std::fs::write(game.join("run.sh"), "old").unwrap();
+
+        // a script of yours, in the settings folder
+        let scripts = home.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("start.bat"), "echo \"$GAME_DIR|$REPO_DIR|$1|$2\" > \"$GAME_DIR/bat.txt\"").unwrap();
+
         let repos = vec![
-            Repo { id: "b".into(), name: "B".into(), url: String::new(), instructions: String::new(),
-                   method: Method::Bat { file: "start.bat".into(), args: "\"{game_dir}\"".into() } },
-            Repo { id: "c".into(), name: "C".into(), url: String::new(), instructions: String::new(),
-                   method: Method::CopyAndRun { copy: vec!["bin/run.sh".into()], run: "run.sh".into(), args: String::new() } },
+            repo("b", Method::Bat { file: "start.bat".into(), args: "\"{game_dir}\" {profile}".into() }),
+            repo(
+                "c",
+                Method::CopyAndRun {
+                    assets: vec!["run.sh".into()],
+                    run: "run.sh".into(),
+                    args: String::new(),
+                },
+            ),
         ];
+        // the cloned repo, and the downloaded release asset
+        let cloned = fetch::repo_dir("https://github.com/test/b");
+        std::fs::create_dir_all(&cloned).unwrap();
+        let downloaded = fetch::repo_dir("https://github.com/test/c");
+        std::fs::create_dir_all(&downloaded).unwrap();
+        std::fs::write(downloaded.join("run.sh"), "new").unwrap();
+
         let mut p = Profile {
-            kind: LaunchKind::Repo,
             repo_id: "b".into(),
             game_dir: game.to_string_lossy().into(),
-            repo_dir: repo.to_string_lossy().into(),
             ..Profile::named("R")
         };
-        launch(&p, &repos, true, |_| {}).unwrap();
-        let g = game.to_string_lossy();
-        assert_eq!(std::fs::read_to_string(game.join("bat.txt")).unwrap().trim(), format!("{g}|{g}"));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        launch(&p, &repos, true, move |code| tx.send(code).unwrap()).unwrap();
+        assert_eq!(rx.recv().unwrap(), Some(0));
+        let (g, r) = (game.to_string_lossy(), cloned.to_string_lossy());
+        assert_eq!(std::fs::read_to_string(game.join("bat.txt")).unwrap().trim(), format!("{g}|{r}|{g}|R"));
 
         p.repo_id = "c".into();
-        let (resolved, copies) = resolve(&p, &repos).unwrap();
-        assert_eq!(resolved.executable, game.join("run.sh").to_string_lossy());
-        assert_eq!(copies, vec![Copy { from: repo.join("bin/run.sh"), to: game.join("run.sh") }]);
-        do_copies(&copies).unwrap();
+        let plan = plan(&p, &repos).unwrap();
+        assert_eq!(plan.program, game.join("run.sh"));
+        assert_eq!(plan.copies, vec![Copy { from: downloaded.join("run.sh"), to: game.join("run.sh") }]);
+        do_copies(&plan.copies).unwrap();
         assert_eq!(std::fs::read_to_string(game.join("run.sh")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(game.join("run.sh.launcher-backup")).unwrap(), "old");
 
-        p.repo_dir.clear();
-        assert!(resolve(&p, &repos).is_err());
+        // nothing downloaded yet, and an id that is not in the list
+        std::fs::remove_file(downloaded.join("run.sh")).unwrap();
+        assert!(plan(&p, &repos).is_err());
         p.repo_id = "missing".into();
-        assert!(resolve(&p, &repos).is_err());
+        assert!(plan(&p, &repos).is_err());
     }
 }
